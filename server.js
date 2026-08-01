@@ -18,6 +18,8 @@ app.use(express.static(path.join(__dirname, "public")));
 // player identity instead of showing up as a stranger with no team/role.
 const rooms = new Map();
 const ROOM_TTL_MS = 20 * 60 * 1000; // clean up abandoned rooms after 20 min of no connected players
+const BOARD_SIZES = [16, 20, 25, 30];
+const DEFAULT_BOARD_SIZE = 25;
 
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I/O to avoid confusion
 function makeRoomCode() {
@@ -37,7 +39,22 @@ function shuffle(arr) {
   return a;
 }
 
-function newBoard(extraWords) {
+// Scales the classic 9/8/7/1 (of 25) color split to any board size while
+// always keeping exactly one assassin and giving the starting team one
+// more agent than the other side.
+function colorCounts(size) {
+  const remaining = size - 1; // minus the assassin
+  // classic 25-card ratio is 9/8/7/1 (starter/other/neutral/assassin);
+  // scale the neutral share by the same proportion (7 of 24 non-assassin cards)
+  const neutral = Math.min(Math.round(remaining * (7 / 24)), remaining - 2); // keep >=1 card per side
+  const leftover = remaining - neutral;
+  const starter = Math.ceil(leftover / 2);
+  const other = Math.floor(leftover / 2);
+  return { starter, other, neutral, assassin: 1 };
+}
+
+function newBoard(extraWords, onlyCustom, boardSize) {
+  const size = BOARD_SIZES.includes(boardSize) ? boardSize : DEFAULT_BOARD_SIZE;
   const seen = new Set();
   const custom = [];
   for (const w of (extraWords || [])) {
@@ -49,35 +66,47 @@ function newBoard(extraWords) {
     const key = w.trim().toUpperCase();
     if (key && !seen.has(key)) { seen.add(key); base.push(key); }
   }
-  // custom words are guaranteed a spot (up to 25 of them); the base word
-  // bank fills whatever slots are left
-  const customPicked = shuffle(custom).slice(0, 25);
-  const basePicked = shuffle(base).slice(0, 25 - customPicked.length);
-  const board25 = shuffle(customPicked.concat(basePicked));
-  const starter = Math.random() < 0.5 ? "red" : "blue";
-  const other = starter === "red" ? "blue" : "red";
+
+  let boardWords;
+  if (onlyCustom && custom.length >= size) {
+    // Use ONLY the words the players supplied — nothing from the built-in bank.
+    boardWords = shuffle(custom).slice(0, size);
+  } else {
+    // Mixed mode: custom words are guaranteed a spot (up to `size` of them);
+    // the base word bank fills whatever slots are left. Also the automatic
+    // fallback if "only custom" was requested but there weren't enough yet.
+    const customPicked = shuffle(custom).slice(0, size);
+    const basePicked = shuffle(base).slice(0, size - customPicked.length);
+    boardWords = shuffle(customPicked.concat(basePicked));
+  }
+
+  const starterTeam = Math.random() < 0.5 ? "red" : "blue";
+  const otherTeam = starterTeam === "red" ? "blue" : "red";
+  const counts = colorCounts(size);
   const colors = [
-    ...Array(9).fill(starter),
-    ...Array(8).fill(other),
-    ...Array(7).fill("neutral"),
-    "assassin",
+    ...Array(counts.starter).fill(starterTeam),
+    ...Array(counts.other).fill(otherTeam),
+    ...Array(counts.neutral).fill("neutral"),
+    ...Array(counts.assassin).fill("assassin"),
   ];
   const shuffledColors = shuffle(colors);
-  const board = board25.map((word, i) => ({
+  const board = boardWords.map((word, i) => ({
     word,
     color: shuffledColors[i],
     revealed: false,
   }));
-  return { board, starter };
+  return { board, starter: starterTeam };
 }
 
 function createRoom(code) {
   const customWords = [];
-  const { board, starter } = newBoard(customWords);
+  const boardSize = DEFAULT_BOARD_SIZE;
+  const { board, starter } = newBoard(customWords, false, boardSize);
   const room = {
     code,
     players: new Map(), // clientId -> {clientId, socketId, name, team, role, connected}
     board,
+    boardSize,
     turnTeam: starter,
     starter,
     phase: "lobby", // lobby | clue | guess | ended
@@ -87,6 +116,7 @@ function createRoom(code) {
     log: [],
     winner: null,
     customWords, // extra words players add on top of the base word bank
+    onlyCustomWords: false, // if true (and enough custom words), skip the base bank entirely
     createdAt: Date.now(),
     lastActivity: Date.now(),
   };
@@ -110,6 +140,9 @@ function publicState(room) {
     log: room.log.slice(-30),
     remaining: { red: scoreRemaining(room, "red"), blue: scoreRemaining(room, "blue") },
     customWords: room.customWords,
+    onlyCustomWords: room.onlyCustomWords,
+    boardSize: room.boardSize,
+    boardSizeOptions: BOARD_SIZES,
     players: Array.from(room.players.values()).map((p) => ({
       id: p.clientId,
       name: p.name,
@@ -203,6 +236,8 @@ io.on("connection", (socket) => {
       existing.name = displayName;
       pushLog(room, `${displayName} reconnected.`);
     } else {
+      // Brand new player: always starts as a spectator (no team/role) —
+      // they must explicitly opt into a team to play.
       room.players.set(clientId, {
         clientId,
         socketId: socket.id,
@@ -211,7 +246,7 @@ io.on("connection", (socket) => {
         role: null,
         connected: true,
       });
-      pushLog(room, `${displayName} joined.`);
+      pushLog(room, `${displayName} joined as a spectator.`);
     }
     broadcastRoom(room);
   }
@@ -248,6 +283,17 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("become_spectator", () => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p) return;
+      p.team = null;
+      p.role = null;
+      pushLog(room, `${p.name} became a spectator.`);
+      broadcastRoom(room);
+    });
+  });
+
   socket.on("add_words", ({ words }) => {
     getRoomOr((room) => {
       const p = getMe(room);
@@ -270,6 +316,26 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("set_word_mode", ({ onlyCustom }) => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "lobby") return;
+      room.onlyCustomWords = !!onlyCustom;
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on("set_board_size", ({ size }) => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "lobby") return;
+      const n = parseInt(size, 10);
+      if (!BOARD_SIZES.includes(n)) return;
+      room.boardSize = n;
+      broadcastRoom(room);
+    });
+  });
+
   socket.on("start_game", () => {
     getRoomOr((room) => {
       const players = Array.from(room.players.values());
@@ -281,7 +347,10 @@ io.on("connection", (socket) => {
       if (!ready) {
         return socket.emit("error_msg", "Need at least one spymaster and one operative on each team.");
       }
-      const { board, starter } = newBoard(room.customWords);
+      if (room.onlyCustomWords && room.customWords.length < room.boardSize) {
+        return socket.emit("error_msg", `"Only my words" is on but you only have ${room.customWords.length}/${room.boardSize} words in the pool. Add more, or turn the toggle off.`);
+      }
+      const { board, starter } = newBoard(room.customWords, room.onlyCustomWords, room.boardSize);
       room.board = board;
       room.starter = starter;
       room.turnTeam = starter;
@@ -291,7 +360,9 @@ io.on("connection", (socket) => {
       room.guessesMade = 0;
       room.winner = null;
       room.log = [];
-      pushLog(room, `New game. ${starter.toUpperCase()} goes first.`);
+      pushLog(room, room.onlyCustomWords
+        ? `New game (${room.boardSize} cards) using only the custom word pool. ${starter.toUpperCase()} goes first.`
+        : `New game (${room.boardSize} cards). ${starter.toUpperCase()} goes first.`);
       broadcastRoom(room);
     });
   });
@@ -356,9 +427,20 @@ io.on("connection", (socket) => {
     });
   });
 
+  socket.on("end_game", () => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase === "lobby" || room.phase === "ended") return;
+      room.phase = "ended";
+      room.winner = null; // aborted, no winner
+      pushLog(room, `${p.name} ended the game early.`);
+      broadcastRoom(room);
+    });
+  });
+
   socket.on("new_game", () => {
     getRoomOr((room) => {
-      const { board, starter } = newBoard(room.customWords);
+      const { board, starter } = newBoard(room.customWords, room.onlyCustomWords, room.boardSize);
       room.board = board;
       room.starter = starter;
       room.turnTeam = starter;
@@ -369,6 +451,17 @@ io.on("connection", (socket) => {
       room.winner = null;
       room.log = [];
       pushLog(room, `New game. ${starter.toUpperCase()} goes first.`);
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on("back_to_lobby", () => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "ended") return;
+      room.phase = "lobby";
+      room.clue = null;
+      room.winner = null;
       broadcastRoom(room);
     });
   });

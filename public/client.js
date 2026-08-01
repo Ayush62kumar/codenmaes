@@ -18,8 +18,10 @@
   const hadStoredRoom = !!roomCode; // did we have a room to try rejoining on load?
   let state = null; // last room_update.state
   let board = null; // last room_update.board
+  let prevBoard = null; // board from before the latest update, for sound-on-reveal diffing
   let errorMsg = "";
   let screen = hadStoredRoom ? "reconnecting" : "home"; // reconnecting | home | lobby | game
+  let soundOn = safeGet("cn_sound") !== "off";
 
   function safeGet(k) {
     try { return sessionStorage.getItem(k); } catch (e) { return null; }
@@ -31,6 +33,49 @@
     try { sessionStorage.removeItem(k); } catch (e) {}
   }
 
+  // ---------------------------------------------------------------- sound
+  // Generated tones via Web Audio API — no external audio files needed.
+  let audioCtx = null;
+  function getAudioCtx() {
+    if (!audioCtx) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (Ctx) audioCtx = new Ctx();
+    }
+    return audioCtx;
+  }
+  function beep(freq, duration, type, delay) {
+    if (!soundOn) return;
+    const ctx = getAudioCtx();
+    if (!ctx) return;
+    const t0 = ctx.currentTime + (delay || 0);
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type || "sine";
+    osc.frequency.setValueAtTime(freq, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.18, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + duration);
+    osc.connect(gain).connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + duration + 0.02);
+  }
+  function playRevealSound(color, wasMyTeam) {
+    if (color === "assassin") {
+      beep(160, 0.35, "sawtooth");
+      beep(110, 0.5, "sawtooth", 0.12);
+    } else if (color === "neutral") {
+      beep(300, 0.18, "triangle");
+    } else if (wasMyTeam === true) {
+      beep(660, 0.12, "sine");
+      beep(880, 0.16, "sine", 0.1);
+    } else {
+      beep(220, 0.22, "square");
+    }
+  }
+  function playClickTick() {
+    beep(500, 0.05, "square");
+  }
+
   socket.on("connect", () => {
     if (hadStoredRoom && screen === "reconnecting" && !state) {
       // Attempt to silently rejoin the room we were in before the refresh.
@@ -40,12 +85,24 @@
   });
 
   socket.on("room_update", (payload) => {
+    prevBoard = board;
     state = payload.state;
     board = payload.board;
     roomCode = state.code;
     safeSet("cn_room", roomCode);
     errorMsg = "";
     screen = state.phase === "lobby" ? "lobby" : "game";
+
+    // Play a sound for any card that just transitioned from hidden to revealed.
+    if (prevBoard && board && prevBoard.length === board.length) {
+      const self = me();
+      for (let i = 0; i < board.length; i++) {
+        if (board[i].revealed && !prevBoard[i].revealed) {
+          const wasMyTeam = self && self.team ? board[i].color === self.team : undefined;
+          playRevealSound(board[i].color, wasMyTeam);
+        }
+      }
+    }
     render();
   });
 
@@ -88,10 +145,30 @@
     return node;
   }
 
+  function toggleSound() {
+    soundOn = !soundOn;
+    safeSet("cn_sound", soundOn ? "on" : "off");
+    if (soundOn) beep(500, 0.08, "sine"); // little confirmation blip
+    render();
+  }
+
+  function identityChip() {
+    const self = me();
+    if (!self) return null;
+    const teamLabel = self.team ? self.team.toUpperCase() : "SPECTATOR";
+    const roleLabel = self.role ? " · " + self.role.toUpperCase() : "";
+    const cls = self.team === "red" ? "identity-chip red" : self.team === "blue" ? "identity-chip blue" : "identity-chip";
+    return el("div", { class: cls }, `${self.name} · ${teamLabel}${roleLabel}`);
+  }
+
   function topbar() {
     return el("div", { class: "topbar" },
       el("div", { class: "brand" }, "CODENAMES", el("small", {}, "CLASSIFIED · INTEL BOARD")),
-      roomCode ? el("div", { class: "room-chip" }, roomCode) : null
+      el("div", { class: "topbar-right" },
+        identityChip(),
+        el("button", { class: "sound-toggle", title: soundOn ? "Mute sound" : "Unmute sound", onclick: toggleSound }, soundOn ? "🔊" : "🔇"),
+        roomCode ? el("div", { class: "room-chip" }, roomCode) : null
+      )
     );
   }
 
@@ -177,6 +254,21 @@
     );
   }
 
+  function spectatorsPanel() {
+    const spectators = state.players.filter((p) => !p.team);
+    return el("div", { class: "panel" },
+      el("h3", {}, "Spectators"),
+      spectators.length
+        ? el("div", {}, spectators.map((p) => el("span", {
+            class: "player-pill" + (p.id === clientId ? " self" : "") + (p.connected === false ? " away" : "")
+          }, p.name + (p.connected === false ? " (away)" : ""))))
+        : el("span", { class: "small-note" }, "Nobody watching right now."),
+      el("p", { class: "small-note", style: "margin-top:8px;text-align:left;" },
+        "New players start here. Pick a team above to play, or stay here to watch."
+      )
+    );
+  }
+
   function setTeamRole(team, role) {
     socket.emit("set_team", { team });
     socket.emit("set_role", { role });
@@ -185,7 +277,8 @@
   function wordPoolPanel() {
     const custom = (state.customWords || []);
     const onlyCustom = !!state.onlyCustomWords;
-    const enoughForOnlyCustom = custom.length >= 25;
+    const need = state.boardSize || 25;
+    const enoughForOnlyCustom = custom.length >= need;
     return el("div", { class: "panel word-pool-panel" },
       el("h3", {}, "Word pool"),
       el("p", { class: "small-note", style: "margin:0 0 10px;text-align:left;" },
@@ -195,17 +288,17 @@
         el("textarea", { id: "extraWords", rows: "2", placeholder: "e.g. PIZZA, MOUNTAIN, WIZARD", style: "flex:1;resize:vertical;padding:8px 10px;border-radius:2px;border:1px solid rgba(231,221,192,0.2);background:var(--ink-3);color:var(--paper);font-family:var(--font-mono);font-size:12px;" }),
         el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 14px;", onclick: onAddWords }, "Add")
       ),
-      el("label", { style: "display:flex;align-items:center;gap:8px;margin-top:12px;font-family:var(--font-mono);font-size:11px;letter-spacing:0.5px;color:rgba(231,221,192,0.75);cursor:pointer;" },
+      el("label", { class: "checkbox-row" },
         el("input", {
           type: "checkbox",
           checked: onlyCustom || false,
           onchange: (e) => socket.emit("set_word_mode", { onlyCustom: e.target.checked }),
         }),
-        `Use ONLY my words for the board (need 25 — you have ${custom.length}/25)`
+        `Use ONLY my words for the board (need ${need} — you have ${custom.length}/${need})`
       ),
       onlyCustom && !enoughForOnlyCustom
         ? el("p", { class: "small-note", style: "margin-top:6px;text-align:left;color:var(--amber-bright);" },
-            `Add ${25 - custom.length} more word${25 - custom.length === 1 ? "" : "s"} before starting — until then the default word bank will fill any gaps.`
+            `Add ${need - custom.length} more word${need - custom.length === 1 ? "" : "s"} before starting — until then the default word bank will fill any gaps.`
           )
         : null,
       custom.length
@@ -225,23 +318,57 @@
     input.value = "";
   }
 
+  function boardSizePanel() {
+    const options = state.boardSizeOptions || [16, 20, 25, 30];
+    const current = state.boardSize || 25;
+    return el("div", { class: "panel" },
+      el("h3", {}, "Board size"),
+      el("div", { class: "size-options" },
+        options.map((n) => el("button", {
+          class: "btn size-btn" + (n === current ? " active" : ""),
+          onclick: () => socket.emit("set_board_size", { size: n }),
+        }, `${n} cards`))
+      )
+    );
+  }
+
   function renderLobby() {
     const self = me();
     const wrap = el("div", { class: "lobby-wrap" },
       el("p", { class: "hint" }, "Share room code ", el("b", {}, roomCode), " with your team. Each side needs one spymaster and at least one operative."),
       errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null,
       el("div", { class: "teams-grid" }, teamDossier("red"), teamDossier("blue")),
+      self && self.team ? el("div", { class: "lobby-controls", style: "margin-bottom:20px;" },
+        el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => socket.emit("become_spectator") }, "Become spectator")
+      ) : null,
+      spectatorsPanel(),
+      boardSizePanel(),
       wordPoolPanel(),
       el("div", { class: "lobby-controls" },
         el("button", { class: "btn btn-primary", onclick: () => socket.emit("start_game") }, "Brief the teams (start game)")
       ),
-      el("p", { class: "small-note" }, self ? `You are ${self.name}${self.team ? " · " + self.team.toUpperCase() : ""}${self.role ? " · " + self.role : ""}` : "")
+      el("p", { class: "small-note" }, self ? `You are ${self.name}${self.team ? " · " + self.team.toUpperCase() : " · SPECTATOR"}${self.role ? " · " + self.role : ""}` : "")
     );
     return wrap;
   }
 
   // ---------------------------------------------------------------- GAME
   const STAMP_LABEL = { red: "RED AGENT", blue: "BLUE AGENT", neutral: "BYSTANDER", assassin: "ASSASSIN" };
+
+  // Deterministic little "redacted photo" swatch per word — no network
+  // images needed, but every card gets a unique visual identity that fits
+  // the dossier theme.
+  function hashHue(str) {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
+    return h % 360;
+  }
+  function photoSwatch(word) {
+    const hue = hashHue(word);
+    const hue2 = (hue + 40) % 360;
+    const style = `background: linear-gradient(135deg, hsl(${hue},38%,30%), hsl(${hue2},30%,18%));`;
+    return el("div", { class: "card-photo", style });
+  }
 
   function cardEl(card, idx, self) {
     const revealed = card.revealed;
@@ -261,10 +388,12 @@
     const node = el("button", {
       class: classes.join(" "),
       style: style.join(";"),
+      type: "button",
       disabled: !isMyTurnGuess,
-      onclick: isMyTurnGuess ? () => socket.emit("guess_word", { index: idx }) : null,
+      onclick: isMyTurnGuess ? () => { playClickTick(); socket.emit("guess_word", { index: idx }); } : null,
     },
-      el("span", {}, card.word),
+      photoSwatch(card.word),
+      el("span", { class: "card-word" }, card.word),
       revealed ? el("div", { class: "stamp" }, el("span", {}, STAMP_LABEL[card.color] || "")) : null
     );
     return node;
@@ -275,8 +404,9 @@
     const isSpymaster = self && self.role === "spymaster";
     const isMyTurn = self && self.team === state.turnTeam;
     const ended = state.phase === "ended";
+    const boardSizeClass = board.length > 25 ? " board-xl" : board.length <= 16 ? " board-sm" : "";
 
-    const boardEl = el("div", { class: "board" }, board.map((c, i) => cardEl(c, i, self)));
+    const boardEl = el("div", { class: "board" + boardSizeClass }, board.map((c, i) => cardEl(c, i, self)));
 
     const scoreboard = el("div", { class: "scoreboard" },
       el("div", { class: "score-badge" + (state.turnTeam === "red" && !ended ? " active" : "") }, "RED", el("span", { class: "num" }, state.remaining.red)),
@@ -285,11 +415,12 @@
 
     const turnBanner = !ended ? el("div", { class: "turn-banner" },
       "Turn: ", el("b", {}, state.turnTeam.toUpperCase()),
-      " · Phase: ", el("b", {}, state.phase === "clue" ? "awaiting clue" : "guessing")
+      " · Phase: ", el("b", {}, state.phase === "clue" ? "awaiting clue" : "guessing"),
+      self && !self.team ? el("span", {}, " · you are spectating") : null
     ) : null;
 
-    const resultBanner = ended ? el("div", { class: "result-banner " + state.winner },
-      `${state.winner.toUpperCase()} TEAM WINS`
+    const resultBanner = ended ? el("div", { class: "result-banner " + (state.winner || "aborted") },
+      state.winner ? `${state.winner.toUpperCase()} TEAM WINS` : "GAME ENDED"
     ) : null;
 
     // clue panel
@@ -321,11 +452,18 @@
         )
       : null;
 
+    const endGamePanel = (!ended && self && self.team)
+      ? el("div", { class: "panel" },
+          el("button", { class: "btn btn-ghost danger", onclick: onEndGame }, "End game")
+        )
+      : null;
+
     const rolePanel = el("div", { class: "panel" },
       el("h3", {}, "Your status"),
-      self ? el("span", { class: "role-badge" }, `${self.name} · ${self.team ? self.team.toUpperCase() : "—"} · ${self.role || "—"}`) : el("span", { class: "small-note" }, "—"),
-      ended ? el("div", { style: "margin-top:12px;" },
-        el("button", { class: "btn btn-primary", onclick: () => socket.emit("new_game") }, "Start new case")
+      self ? el("span", { class: "role-badge" }, `${self.name} · ${self.team ? self.team.toUpperCase() : "SPECTATOR"} · ${self.role || "—"}`) : el("span", { class: "small-note" }, "—"),
+      ended ? el("div", { style: "margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;" },
+        el("button", { class: "btn btn-primary", style: "width:auto;", onclick: () => socket.emit("new_game") }, "Rematch"),
+        el("button", { class: "btn btn-ghost", style: "width:auto;", onclick: () => socket.emit("back_to_lobby") }, "Back to lobby")
       ) : null
     );
 
@@ -334,7 +472,7 @@
       el("ul", { class: "log-list" }, (state.log || []).map((l) => el("li", {}, l.text)))
     );
 
-    const sidebar = el("div", { class: "sidebar" }, cluePanel, controlsPanel, rolePanel, logPanel);
+    const sidebar = el("div", { class: "sidebar" }, cluePanel, controlsPanel, endGamePanel, rolePanel, logPanel);
 
     const wrap = el("div", { class: "game-wrap" },
       scoreboard,
@@ -344,6 +482,12 @@
       sidebar
     );
     return wrap;
+  }
+
+  function onEndGame() {
+    if (confirm("End the game now for everyone?")) {
+      socket.emit("end_game");
+    }
   }
 
   function sendClue() {
