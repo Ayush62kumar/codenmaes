@@ -2,34 +2,61 @@
   const app = document.getElementById("app");
   const socket = io();
 
-  let myId = null;
-  let myName = localStorage_safeGet("cn_name") || "";
-  let roomCode = localStorage_safeGet("cn_room") || "";
+  // A persistent identity for this browser tab, independent of the socket
+  // connection. socket.id changes on every reconnect (e.g. a page refresh),
+  // but clientId survives via sessionStorage, so the server can recognize
+  // "this is the same player coming back" and restore their team/role
+  // instead of treating them as a brand new stranger.
+  let clientId = safeGet("cn_client_id");
+  if (!clientId) {
+    clientId = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ("c" + Date.now() + Math.random().toString(16).slice(2));
+    safeSet("cn_client_id", clientId);
+  }
+
+  let myName = safeGet("cn_name") || "";
+  let roomCode = safeGet("cn_room") || "";
+  const hadStoredRoom = !!roomCode; // did we have a room to try rejoining on load?
   let state = null; // last room_update.state
   let board = null; // last room_update.board
   let errorMsg = "";
-  let screen = "home"; // home | lobby | game
+  let screen = hadStoredRoom ? "reconnecting" : "home"; // reconnecting | home | lobby | game
 
-  function localStorage_safeGet(k) {
+  function safeGet(k) {
     try { return sessionStorage.getItem(k); } catch (e) { return null; }
   }
-  function localStorage_safeSet(k, v) {
+  function safeSet(k, v) {
     try { sessionStorage.setItem(k, v); } catch (e) {}
   }
+  function safeClear(k) {
+    try { sessionStorage.removeItem(k); } catch (e) {}
+  }
 
-  socket.on("connect", () => { myId = socket.id; render(); });
+  socket.on("connect", () => {
+    if (hadStoredRoom && screen === "reconnecting" && !state) {
+      // Attempt to silently rejoin the room we were in before the refresh.
+      socket.emit("join_room", { code: roomCode, name: myName, clientId });
+    }
+    render();
+  });
 
   socket.on("room_update", (payload) => {
     state = payload.state;
     board = payload.board;
     roomCode = state.code;
-    localStorage_safeSet("cn_room", roomCode);
+    safeSet("cn_room", roomCode);
     errorMsg = "";
     screen = state.phase === "lobby" ? "lobby" : "game";
     render();
   });
 
   socket.on("error_msg", (msg) => {
+    if (screen === "reconnecting") {
+      // The room we tried to rejoin is gone (server restarted, room expired,
+      // etc.) — fall back to the home screen instead of getting stuck.
+      safeClear("cn_room");
+      roomCode = "";
+      screen = "home";
+    }
     errorMsg = msg;
     render();
   });
@@ -41,7 +68,7 @@
 
   function me() {
     if (!state) return null;
-    return state.players.find((p) => p.id === myId) || null;
+    return state.players.find((p) => p.id === clientId) || null;
   }
 
   // ---------------------------------------------------------------- helpers
@@ -65,6 +92,17 @@
     return el("div", { class: "topbar" },
       el("div", { class: "brand" }, "CODENAMES", el("small", {}, "CLASSIFIED · INTEL BOARD")),
       roomCode ? el("div", { class: "room-chip" }, roomCode) : null
+    );
+  }
+
+  // ---------------------------------------------------------------- RECONNECTING
+  function renderReconnecting() {
+    return el("div", { class: "center-screen" },
+      el("div", { class: "folder-card", "data-tab": "CASE FILE · RESUMING" },
+        el("h1", {}, "Reconnecting…"),
+        el("p", { class: "sub" }, `Rejoining room ${roomCode}.`),
+        errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null
+      )
     );
   }
 
@@ -94,19 +132,19 @@
   function readName() {
     const input = document.getElementById("nameInput");
     myName = (input.value || "Agent").trim().slice(0, 24) || "Agent";
-    localStorage_safeSet("cn_name", myName);
+    safeSet("cn_name", myName);
     return myName;
   }
 
   function onCreate() {
     const name = readName();
-    socket.emit("create_room", { name });
+    socket.emit("create_room", { name, clientId });
   }
   function onJoin() {
     const name = readName();
     const code = (document.getElementById("codeInput").value || "").trim().toUpperCase();
     if (!code) { errorMsg = "Enter a room code."; return render(); }
-    socket.emit("join_room", { code, name });
+    socket.emit("join_room", { code, name, clientId });
   }
 
   // ---------------------------------------------------------------- LOBBY
@@ -118,7 +156,10 @@
     const unassigned = players.filter((p) => !p.role);
 
     function pill(p) {
-      return el("span", { class: "player-pill" + (p.id === myId ? " self" : "") }, p.name);
+      const away = p.connected === false;
+      return el("span", { class: "player-pill" + (p.id === clientId ? " self" : "") + (away ? " away" : "") },
+        p.name + (away ? " (away)" : "")
+      );
     }
 
     return el("div", { class: "team-dossier" + (team === "blue" ? " blue" : "") },
@@ -141,12 +182,56 @@
     socket.emit("set_role", { role });
   }
 
+  function wordPoolPanel() {
+    const custom = (state.customWords || []);
+    const onlyCustom = !!state.onlyCustomWords;
+    const enoughForOnlyCustom = custom.length >= 25;
+    return el("div", { class: "panel word-pool-panel" },
+      el("h3", {}, "Word pool"),
+      el("p", { class: "small-note", style: "margin:0 0 10px;text-align:left;" },
+        "Add your own words to mix into the board (comma or newline separated)."
+      ),
+      el("div", { class: "clue-form", style: "align-items:flex-start;" },
+        el("textarea", { id: "extraWords", rows: "2", placeholder: "e.g. PIZZA, MOUNTAIN, WIZARD", style: "flex:1;resize:vertical;padding:8px 10px;border-radius:2px;border:1px solid rgba(231,221,192,0.2);background:var(--ink-3);color:var(--paper);font-family:var(--font-mono);font-size:12px;" }),
+        el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 14px;", onclick: onAddWords }, "Add")
+      ),
+      el("label", { style: "display:flex;align-items:center;gap:8px;margin-top:12px;font-family:var(--font-mono);font-size:11px;letter-spacing:0.5px;color:rgba(231,221,192,0.75);cursor:pointer;" },
+        el("input", {
+          type: "checkbox",
+          checked: onlyCustom || false,
+          onchange: (e) => socket.emit("set_word_mode", { onlyCustom: e.target.checked }),
+        }),
+        `Use ONLY my words for the board (need 25 — you have ${custom.length}/25)`
+      ),
+      onlyCustom && !enoughForOnlyCustom
+        ? el("p", { class: "small-note", style: "margin-top:6px;text-align:left;color:var(--amber-bright);" },
+            `Add ${25 - custom.length} more word${25 - custom.length === 1 ? "" : "s"} before starting — until then the default word bank will fill any gaps.`
+          )
+        : null,
+      custom.length
+        ? el("p", { class: "small-note", style: "margin-top:10px;text-align:left;" },
+            `${custom.length} custom word${custom.length === 1 ? "" : "s"} in the pool: `,
+            custom.join(", ")
+          )
+        : null
+    );
+  }
+
+  function onAddWords() {
+    const input = document.getElementById("extraWords");
+    const words = input.value.trim();
+    if (!words) return;
+    socket.emit("add_words", { words });
+    input.value = "";
+  }
+
   function renderLobby() {
     const self = me();
     const wrap = el("div", { class: "lobby-wrap" },
       el("p", { class: "hint" }, "Share room code ", el("b", {}, roomCode), " with your team. Each side needs one spymaster and at least one operative."),
       errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null,
       el("div", { class: "teams-grid" }, teamDossier("red"), teamDossier("blue")),
+      wordPoolPanel(),
       el("div", { class: "lobby-controls" },
         el("button", { class: "btn btn-primary", onclick: () => socket.emit("start_game") }, "Brief the teams (start game)")
       ),
@@ -273,7 +358,7 @@
     app.innerHTML = "";
     app.appendChild(topbar());
     if (!state) {
-      app.appendChild(renderHome());
+      app.appendChild(screen === "reconnecting" ? renderReconnecting() : renderHome());
       return;
     }
     if (screen === "lobby") app.appendChild(renderLobby());

@@ -12,7 +12,12 @@ app.use(express.static(path.join(__dirname, "public")));
 
 // ---- In-memory room store -------------------------------------------------
 // rooms: Map<code, RoomState>
+// Players are keyed by a persistent clientId (generated client-side and
+// stored in sessionStorage) rather than socket.id, so a page refresh —
+// which creates a brand new socket connection — can rejoin the same
+// player identity instead of showing up as a stranger with no team/role.
 const rooms = new Map();
+const ROOM_TTL_MS = 20 * 60 * 1000; // clean up abandoned rooms after 20 min of no connected players
 
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I/O to avoid confusion
 function makeRoomCode() {
@@ -32,8 +37,23 @@ function shuffle(arr) {
   return a;
 }
 
-function newBoard() {
-  const chosen = shuffle(WORDS).slice(0, 25);
+function newBoard(extraWords) {
+  const seen = new Set();
+  const custom = [];
+  for (const w of (extraWords || [])) {
+    const key = w.trim().toUpperCase();
+    if (key && !seen.has(key)) { seen.add(key); custom.push(key); }
+  }
+  const base = [];
+  for (const w of WORDS) {
+    const key = w.trim().toUpperCase();
+    if (key && !seen.has(key)) { seen.add(key); base.push(key); }
+  }
+  // custom words are guaranteed a spot (up to 25 of them); the base word
+  // bank fills whatever slots are left
+  const customPicked = shuffle(custom).slice(0, 25);
+  const basePicked = shuffle(base).slice(0, 25 - customPicked.length);
+  const board25 = shuffle(customPicked.concat(basePicked));
   const starter = Math.random() < 0.5 ? "red" : "blue";
   const other = starter === "red" ? "blue" : "red";
   const colors = [
@@ -43,7 +63,7 @@ function newBoard() {
     "assassin",
   ];
   const shuffledColors = shuffle(colors);
-  const board = chosen.map((word, i) => ({
+  const board = board25.map((word, i) => ({
     word,
     color: shuffledColors[i],
     revealed: false,
@@ -52,10 +72,11 @@ function newBoard() {
 }
 
 function createRoom(code) {
-  const { board, starter } = newBoard();
+  const customWords = [];
+  const { board, starter } = newBoard(customWords);
   const room = {
     code,
-    players: new Map(), // socketId -> {id, name, team, role}
+    players: new Map(), // clientId -> {clientId, socketId, name, team, role, connected}
     board,
     turnTeam: starter,
     starter,
@@ -65,7 +86,9 @@ function createRoom(code) {
     guessesMade: 0,
     log: [],
     winner: null,
+    customWords, // extra words players add on top of the base word bank
     createdAt: Date.now(),
+    lastActivity: Date.now(),
   };
   rooms.set(code, room);
   return room;
@@ -86,11 +109,13 @@ function publicState(room) {
     winner: room.winner,
     log: room.log.slice(-30),
     remaining: { red: scoreRemaining(room, "red"), blue: scoreRemaining(room, "blue") },
+    customWords: room.customWords,
     players: Array.from(room.players.values()).map((p) => ({
-      id: p.id,
+      id: p.clientId,
       name: p.name,
       team: p.team,
       role: p.role,
+      connected: p.connected,
     })),
   };
 }
@@ -106,9 +131,11 @@ function boardFor(room, player) {
 }
 
 function broadcastRoom(room) {
+  room.lastActivity = Date.now();
   const state = publicState(room);
-  for (const [socketId, player] of room.players.entries()) {
-    io.to(socketId).emit("room_update", { state, board: boardFor(room, player) });
+  for (const player of room.players.values()) {
+    if (!player.connected || !player.socketId) continue;
+    io.to(player.socketId).emit("room_update", { state, board: boardFor(room, player) });
   }
 }
 
@@ -136,8 +163,21 @@ function switchTurn(room) {
   room.guessesMade = 0;
 }
 
+// Periodically clean up rooms nobody is connected to anymore, giving
+// refreshing/reconnecting players plenty of time to come back first.
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, room] of rooms.entries()) {
+    const anyoneConnected = Array.from(room.players.values()).some((p) => p.connected);
+    if (!anyoneConnected && now - room.lastActivity > ROOM_TTL_MS) {
+      rooms.delete(code);
+    }
+  }
+}, 5 * 60 * 1000).unref();
+
 io.on("connection", (socket) => {
   let currentRoomCode = null;
+  let currentClientId = null;
 
   function getRoomOr(cb) {
     const room = rooms.get(currentRoomCode);
@@ -145,29 +185,54 @@ io.on("connection", (socket) => {
     cb(room);
   }
 
-  socket.on("create_room", ({ name }) => {
+  function getMe(room) {
+    return currentClientId ? room.players.get(currentClientId) : null;
+  }
+
+  function joinOrCreate(room, { name, clientId }) {
+    const displayName = (name || "Agent").slice(0, 24) || "Agent";
+    currentRoomCode = room.code;
+    currentClientId = clientId;
+    socket.join(room.code);
+
+    const existing = room.players.get(clientId);
+    if (existing) {
+      // Reconnect: keep their team/role, just reattach the live socket.
+      existing.socketId = socket.id;
+      existing.connected = true;
+      existing.name = displayName;
+      pushLog(room, `${displayName} reconnected.`);
+    } else {
+      room.players.set(clientId, {
+        clientId,
+        socketId: socket.id,
+        name: displayName,
+        team: null,
+        role: null,
+        connected: true,
+      });
+      pushLog(room, `${displayName} joined.`);
+    }
+    broadcastRoom(room);
+  }
+
+  socket.on("create_room", ({ name, clientId }) => {
+    if (!clientId) return socket.emit("error_msg", "Missing client id.");
     const code = makeRoomCode();
     const room = createRoom(code);
-    currentRoomCode = code;
-    room.players.set(socket.id, { id: socket.id, name: name?.slice(0, 24) || "Agent", team: null, role: null });
-    socket.join(code);
-    pushLog(room, `${name || "Agent"} created the room.`);
-    broadcastRoom(room);
+    joinOrCreate(room, { name, clientId });
   });
 
-  socket.on("join_room", ({ code, name }) => {
+  socket.on("join_room", ({ code, name, clientId }) => {
+    if (!clientId) return socket.emit("error_msg", "Missing client id.");
     const room = rooms.get((code || "").toUpperCase());
     if (!room) return socket.emit("error_msg", "No room with that code.");
-    currentRoomCode = room.code;
-    room.players.set(socket.id, { id: socket.id, name: name?.slice(0, 24) || "Agent", team: null, role: null });
-    socket.join(room.code);
-    pushLog(room, `${name || "Agent"} joined.`);
-    broadcastRoom(room);
+    joinOrCreate(room, { name, clientId });
   });
 
   socket.on("set_team", ({ team }) => {
     getRoomOr((room) => {
-      const p = room.players.get(socket.id);
+      const p = getMe(room);
       if (!p) return;
       p.team = team;
       broadcastRoom(room);
@@ -176,9 +241,31 @@ io.on("connection", (socket) => {
 
   socket.on("set_role", ({ role }) => {
     getRoomOr((room) => {
-      const p = room.players.get(socket.id);
+      const p = getMe(room);
       if (!p) return;
       p.role = role;
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on("add_words", ({ words }) => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "lobby") return;
+      const incoming = String(words || "")
+        .split(/[,\n]/)
+        .map((w) => w.trim().toUpperCase())
+        .filter((w) => w.length > 0 && w.length <= 24);
+      const existing = new Set(room.customWords.concat(WORDS));
+      let added = 0;
+      for (const w of incoming) {
+        if (!existing.has(w)) {
+          existing.add(w);
+          room.customWords.push(w);
+          added++;
+        }
+      }
+      if (added > 0) pushLog(room, `${p.name} added ${added} word${added === 1 ? "" : "s"} to the pool.`);
       broadcastRoom(room);
     });
   });
@@ -194,7 +281,7 @@ io.on("connection", (socket) => {
       if (!ready) {
         return socket.emit("error_msg", "Need at least one spymaster and one operative on each team.");
       }
-      const { board, starter } = newBoard();
+      const { board, starter } = newBoard(room.customWords);
       room.board = board;
       room.starter = starter;
       room.turnTeam = starter;
@@ -211,7 +298,7 @@ io.on("connection", (socket) => {
 
   socket.on("give_clue", ({ word, number }) => {
     getRoomOr((room) => {
-      const p = room.players.get(socket.id);
+      const p = getMe(room);
       if (!p || p.role !== "spymaster" || p.team !== room.turnTeam || room.phase !== "clue") return;
       const n = Math.max(0, Math.min(9, parseInt(number, 10) || 0));
       room.clue = { word: (word || "").slice(0, 40), number: n };
@@ -225,7 +312,7 @@ io.on("connection", (socket) => {
 
   socket.on("guess_word", ({ index }) => {
     getRoomOr((room) => {
-      const p = room.players.get(socket.id);
+      const p = getMe(room);
       if (!p || p.role !== "operative" || p.team !== room.turnTeam || room.phase !== "guess") return;
       const card = room.board[index];
       if (!card || card.revealed) return;
@@ -261,7 +348,7 @@ io.on("connection", (socket) => {
 
   socket.on("end_turn", () => {
     getRoomOr((room) => {
-      const p = room.players.get(socket.id);
+      const p = getMe(room);
       if (!p || p.team !== room.turnTeam || room.phase !== "guess") return;
       pushLog(room, `${room.turnTeam.toUpperCase()} ended their turn.`);
       switchTurn(room);
@@ -271,7 +358,7 @@ io.on("connection", (socket) => {
 
   socket.on("new_game", () => {
     getRoomOr((room) => {
-      const { board, starter } = newBoard();
+      const { board, starter } = newBoard(room.customWords);
       room.board = board;
       room.starter = starter;
       room.turnTeam = starter;
@@ -290,14 +377,15 @@ io.on("connection", (socket) => {
     if (!currentRoomCode) return;
     const room = rooms.get(currentRoomCode);
     if (!room) return;
-    const p = room.players.get(socket.id);
-    room.players.delete(socket.id);
-    if (p) pushLog(room, `${p.name} disconnected.`);
-    if (room.players.size === 0) {
-      rooms.delete(room.code);
-    } else {
-      broadcastRoom(room);
-    }
+    const p = getMe(room);
+    if (!p) return;
+    // Don't delete the player — a page refresh looks identical to a real
+    // disconnect from the server's point of view, so we just mark them as
+    // away and let joinOrCreate() restore them if/when they reconnect with
+    // the same clientId. The periodic sweep cleans up truly abandoned rooms.
+    p.connected = false;
+    pushLog(room, `${p.name} disconnected.`);
+    broadcastRoom(room);
   });
 });
 
