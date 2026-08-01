@@ -355,20 +355,72 @@
   // ---------------------------------------------------------------- GAME
   const STAMP_LABEL = { red: "RED AGENT", blue: "BLUE AGENT", neutral: "BYSTANDER", assassin: "ASSASSIN" };
 
-  // Deterministic little "redacted photo" swatch per word — no network
-  // images needed, but every card gets a unique visual identity that fits
-  // the dossier theme.
-  function hashHue(str) {
-    let h = 0;
-    for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
-    return h % 360;
+  // Every word gets a unique little generated "case photo" — an abstract
+  // icon built from a handful of shapes, deterministically derived from the
+  // word itself (same seed everywhere, so every player's board matches).
+  // This isn't a stand-in for a real photo of the word; it's a distinct
+  // piece of generative art per card, in the spirit of a dossier snapshot.
+  function hashString(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return h >>> 0;
+  }
+  function mulberry32(seed) {
+    let a = seed;
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const SHAPE_KINDS = ["circle", "rect", "triangle", "ring"];
+  function wordIcon(word) {
+    const rand = mulberry32(hashString(word));
+    const hue = Math.floor(rand() * 360);
+    const hue2 = (hue + 30 + Math.floor(rand() * 60)) % 360;
+    const bgA = `hsl(${hue}, 42%, ${22 + Math.floor(rand() * 10)}%)`;
+    const bgB = `hsl(${hue2}, 36%, ${14 + Math.floor(rand() * 8)}%)`;
+    const shapeCount = 3 + Math.floor(rand() * 3); // 3-5 shapes
+    let shapes = "";
+    for (let i = 0; i < shapeCount; i++) {
+      const kind = SHAPE_KINDS[Math.floor(rand() * SHAPE_KINDS.length)];
+      const cx = 10 + rand() * 80;
+      const cy = 6 + rand() * 24;
+      const size = 4 + rand() * 11;
+      const accentHue = (hue + 140 + Math.floor(rand() * 80)) % 360;
+      const fill = `hsla(${accentHue}, 70%, ${55 + Math.floor(rand() * 20)}%, ${0.35 + rand() * 0.45})`;
+      if (kind === "circle") {
+        shapes += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${size.toFixed(1)}" fill="${fill}" />`;
+      } else if (kind === "rect") {
+        const rot = Math.floor(rand() * 360);
+        shapes += `<rect x="${(cx - size / 2).toFixed(1)}" y="${(cy - size / 2).toFixed(1)}" width="${size.toFixed(1)}" height="${size.toFixed(1)}" fill="${fill}" transform="rotate(${rot} ${cx.toFixed(1)} ${cy.toFixed(1)})" />`;
+      } else if (kind === "triangle") {
+        const p1 = `${cx.toFixed(1)},${(cy - size).toFixed(1)}`;
+        const p2 = `${(cx - size).toFixed(1)},${(cy + size * 0.7).toFixed(1)}`;
+        const p3 = `${(cx + size).toFixed(1)},${(cy + size * 0.7).toFixed(1)}`;
+        shapes += `<polygon points="${p1} ${p2} ${p3}" fill="${fill}" />`;
+      } else {
+        shapes += `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${size.toFixed(1)}" fill="none" stroke="${fill}" stroke-width="${(1.5 + rand() * 2).toFixed(1)}" />`;
+      }
+    }
+    return `<svg viewBox="0 0 100 34" preserveAspectRatio="xMidYMid slice" xmlns="http://www.w3.org/2000/svg">` +
+      `<rect width="100" height="34" fill="${bgA}" />` +
+      `<rect width="100" height="34" fill="url(#g)" opacity="0.5" />` +
+      `<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${bgA}"/><stop offset="1" stop-color="${bgB}"/></linearGradient></defs>` +
+      shapes +
+      `</svg>`;
   }
   function photoSwatch(word) {
-    const hue = hashHue(word);
-    const hue2 = (hue + 40) % 360;
-    const style = `background: linear-gradient(135deg, hsl(${hue},38%,30%), hsl(${hue2},30%,18%));`;
-    return el("div", { class: "card-photo", style });
+    const div = el("div", { class: "card-photo" });
+    div.innerHTML = wordIcon(word);
+    return div;
   }
+
+  const COLOR_LETTER = { red: "R", blue: "B", neutral: "N", assassin: "A" };
 
   function cardEl(card, idx, self) {
     const revealed = card.revealed;
@@ -379,10 +431,12 @@
       self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && !revealed;
 
     const style = [];
+    let keyBadge = null;
     if (canSeeColor) {
       const edge = card.color === "red" ? "var(--red)" : card.color === "blue" ? "var(--blue)" : card.color === "assassin" ? "var(--assassin)" : "var(--neutral)";
-      classes.push("key-edge");
+      classes.push("key-edge", "key-edge-" + card.color);
       style.push(`--edge-color:${edge}`);
+      keyBadge = el("div", { class: "key-badge key-badge-" + card.color }, COLOR_LETTER[card.color]);
     }
 
     const node = el("button", {
@@ -393,6 +447,7 @@
       onclick: isMyTurnGuess ? () => { playClickTick(); socket.emit("guess_word", { index: idx }); } : null,
     },
       photoSwatch(card.word),
+      keyBadge,
       el("span", { class: "card-word" }, card.word),
       revealed ? el("div", { class: "stamp" }, el("span", {}, STAMP_LABEL[card.color] || "")) : null
     );
