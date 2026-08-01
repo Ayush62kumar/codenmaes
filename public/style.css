@@ -389,6 +389,80 @@ button {
   gap: 26px;
   padding: 10px 0 4px;
 }
+
+.view-toggle {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.view-toggle .btn.active { background: var(--amber); color: var(--ink); border-color: var(--amber); font-weight: 700; }
+
+/* Spymaster clue-drafting: a private checkmark on words they've mentally
+   earmarked for the clue they're about to give. Client-side only. */
+.card.targeted { box-shadow: inset 0 0 0 6px var(--edge-color, var(--amber)), 0 0 0 3px var(--amber-bright), 0 4px 10px rgba(0,0,0,0.35); }
+.target-mark {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--amber-bright);
+  color: var(--ink);
+  font-weight: 900;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 3;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.4);
+}
+
+/* Grouped key view: spymaster's own words sorted into team columns instead
+   of the shuffled board layout, for faster scanning while drafting a clue. */
+.grouped-key { display: flex; flex-direction: column; gap: 16px; }
+.key-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.key-columns-secondary { opacity: 0.85; }
+.key-column {
+  background: var(--ink-2);
+  border-radius: 3px;
+  padding: 12px;
+  box-shadow: var(--shadow);
+  border-top: 5px solid var(--neutral);
+}
+.key-column-red { border-top-color: var(--red); }
+.key-column-blue { border-top-color: var(--blue); }
+.key-column-assassin { border-top-color: var(--assassin); }
+.key-column h4 {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--amber);
+  margin: 0 0 10px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.key-column-count {
+  background: var(--ink-3);
+  border-radius: 10px;
+  padding: 1px 8px;
+  font-size: 10px;
+  color: var(--paper);
+}
+.key-column-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(90px, 1fr));
+  gap: 8px;
+}
+.key-column-list .card { min-height: 76px; }
+@media (max-width: 640px) {
+  .key-columns { grid-template-columns: 1fr; }
+  .key-column-list { grid-template-columns: repeat(2, 1fr); }
+}
 .score-badge {
   font-family: var(--font-stamp);
   font-size: 15px;

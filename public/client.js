@@ -22,6 +22,9 @@
   let errorMsg = "";
   let screen = hadStoredRoom ? "reconnecting" : "home"; // reconnecting | home | lobby | game
   let soundOn = safeGet("cn_sound") !== "off";
+  let selectedTargets = new Set(); // indices the spymaster has privately marked while drafting a clue
+  let groupedKeyView = false; // spymaster: grouped-by-team key view instead of the shuffled grid
+  let lastTurnKey = null; // detects a new turn so we can clear stale target selections
 
   function safeGet(k) {
     try { return sessionStorage.getItem(k); } catch (e) { return null; }
@@ -92,6 +95,14 @@
     safeSet("cn_room", roomCode);
     errorMsg = "";
     screen = state.phase === "lobby" ? "lobby" : "game";
+
+    // A fresh turn (new turnTeam, or clue cleared going back into "clue"
+    // phase) invalidates any previously marked clue-draft targets.
+    const turnKey = state.turnTeam + ":" + (state.clue ? "1" : "0") + ":" + state.phase;
+    if (lastTurnKey !== null && turnKey !== lastTurnKey && state.phase === "clue") {
+      selectedTargets = new Set();
+    }
+    lastTurnKey = turnKey;
 
     // Play a sound for any card that just transitioned from hidden to revealed.
     if (prevBoard && board && prevBoard.length === board.length) {
@@ -422,6 +433,12 @@
 
   const COLOR_LETTER = { red: "R", blue: "B", neutral: "N", assassin: "A" };
 
+  function toggleTarget(idx) {
+    if (selectedTargets.has(idx)) selectedTargets.delete(idx);
+    else selectedTargets.add(idx);
+    render();
+  }
+
   function cardEl(card, idx, self) {
     const revealed = card.revealed;
     const classes = ["card"];
@@ -429,6 +446,9 @@
     const canSeeColor = card.color !== undefined && !revealed; // spymaster-only pre-reveal
     const isMyTurnGuess =
       self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && !revealed;
+    const canMarkTarget =
+      self && self.role === "spymaster" && self.team === state.turnTeam && state.phase === "clue" && !revealed;
+    const isTargeted = canMarkTarget && selectedTargets.has(idx);
 
     const style = [];
     let keyBadge = null;
@@ -438,20 +458,65 @@
       style.push(`--edge-color:${edge}`);
       keyBadge = el("div", { class: "key-badge key-badge-" + card.color }, COLOR_LETTER[card.color]);
     }
+    if (isTargeted) classes.push("targeted");
+
+    const clickable = isMyTurnGuess || canMarkTarget;
+    const onClick = isMyTurnGuess
+      ? () => { playClickTick(); socket.emit("guess_word", { index: idx }); }
+      : canMarkTarget
+        ? () => toggleTarget(idx)
+        : null;
 
     const node = el("button", {
       class: classes.join(" "),
       style: style.join(";"),
       type: "button",
-      disabled: !isMyTurnGuess,
-      onclick: isMyTurnGuess ? () => { playClickTick(); socket.emit("guess_word", { index: idx }); } : null,
+      disabled: !clickable,
+      onclick: onClick,
     },
       photoSwatch(card.word),
       keyBadge,
+      isTargeted ? el("div", { class: "target-mark" }, "✓") : null,
       el("span", { class: "card-word" }, card.word),
       revealed ? el("div", { class: "stamp" }, el("span", {}, STAMP_LABEL[card.color] || "")) : null
     );
     return node;
+  }
+
+  // Groups the spymaster's key by team instead of showing the shuffled
+  // board order — easier to scan your own team's remaining words at a
+  // glance while drafting a clue. Words stay clickable to mark targets.
+  function groupedKeyColumn(label, color, entries) {
+    return el("div", { class: "key-column key-column-" + color },
+      el("h4", {}, label, el("span", { class: "key-column-count" }, entries.length)),
+      el("div", { class: "key-column-list" },
+        entries.map(({ card, idx, self }) => cardEl(card, idx, self))
+      )
+    );
+  }
+
+  function renderGroupedKeyView(self) {
+    const groups = { red: [], blue: [], neutral: [], assassin: [] };
+    board.forEach((card, idx) => {
+      if (!card.revealed) groups[card.color].push({ card, idx, self });
+    });
+    const revealedCount = board.filter((c) => c.revealed).length;
+    return el("div", { class: "grouped-key" },
+      el("div", { class: "key-columns" },
+        groupedKeyColumn("RED", "red", groups.red),
+        groupedKeyColumn("BLUE", "blue", groups.blue)
+      ),
+      el("div", { class: "key-columns key-columns-secondary" },
+        groupedKeyColumn("NEUTRAL", "neutral", groups.neutral),
+        groupedKeyColumn("ASSASSIN", "assassin", groups.assassin)
+      ),
+      revealedCount ? el("p", { class: "small-note", style: "margin-top:10px;" }, `${revealedCount} word${revealedCount === 1 ? "" : "s"} already revealed are hidden from this view.`) : null
+    );
+  }
+
+  function toggleGroupedView() {
+    groupedKeyView = !groupedKeyView;
+    render();
   }
 
   function renderGame() {
@@ -461,7 +526,17 @@
     const ended = state.phase === "ended";
     const boardSizeClass = board.length > 25 ? " board-xl" : board.length <= 16 ? " board-sm" : "";
 
-    const boardEl = el("div", { class: "board" + boardSizeClass }, board.map((c, i) => cardEl(c, i, self)));
+    const showGrouped = isSpymaster && groupedKeyView && !ended;
+    const viewToggle = (isSpymaster && !ended)
+      ? el("div", { class: "view-toggle" },
+          el("button", { class: "btn btn-ghost" + (!groupedKeyView ? " active" : ""), style: "width:auto;padding:6px 14px;font-size:11px;", onclick: () => { groupedKeyView = false; render(); } }, "Grid view"),
+          el("button", { class: "btn btn-ghost" + (groupedKeyView ? " active" : ""), style: "width:auto;padding:6px 14px;font-size:11px;", onclick: () => { groupedKeyView = true; render(); } }, "Grouped key view")
+        )
+      : null;
+
+    const boardEl = showGrouped
+      ? renderGroupedKeyView(self)
+      : el("div", { class: "board" + boardSizeClass }, board.map((c, i) => cardEl(c, i, self)));
 
     const scoreboard = el("div", { class: "scoreboard" },
       el("div", { class: "score-badge" + (state.turnTeam === "red" && !ended ? " active" : "") }, "RED", el("span", { class: "num" }, state.remaining.red)),
@@ -533,6 +608,7 @@
       scoreboard,
       turnBanner,
       resultBanner,
+      viewToggle,
       boardEl,
       sidebar
     );
