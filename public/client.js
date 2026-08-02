@@ -1,6 +1,11 @@
 (function () {
   const app = document.getElementById("app");
-  const socket = io();
+  const socket = io({
+    reconnection: true,
+    reconnectionAttempts: Infinity,
+    reconnectionDelay: 500,
+    reconnectionDelayMax: 5000,
+  });
 
   // A persistent identity for this browser tab, independent of the socket
   // connection. socket.id changes on every reconnect (e.g. a page refresh),
@@ -82,8 +87,14 @@
   }
 
   socket.on("connect", () => {
-    if (hadStoredRoom && screen === "reconnecting" && !state) {
-      // Attempt to silently rejoin the room we were in before the refresh.
+    // Re-sync with our room on EVERY connection, not just the first page
+    // load. Socket.io reconnects automatically after a network blip, tab
+    // backgrounding, laptop sleep, etc. — but each reconnect gets a new
+    // socket.id, and the server only knows to route updates to us if we
+    // tell it "this clientId is back" via join_room. Without this, a
+    // silent reconnect would leave us subscribed to nothing, looking
+    // exactly like "the app stopped updating" until a manual reload.
+    if (roomCode && clientId) {
       socket.emit("join_room", { code: roomCode, name: myName, clientId });
     }
     render();
