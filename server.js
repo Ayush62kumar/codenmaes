@@ -8,7 +8,19 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-app.use(express.static(path.join(__dirname, "public")));
+// no-cache on every static asset: this app's client.js talks a live
+// protocol to server.js, so a browser holding onto a stale cached copy
+// after an update can misbehave in ways that only a hard refresh fixes.
+// Explicitly telling the browser not to cache avoids that entirely.
+app.use(express.static(path.join(__dirname, "public"), {
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+  },
+}));
 
 // ---- In-memory room store -------------------------------------------------
 // rooms: Map<code, RoomState>
@@ -18,7 +30,7 @@ app.use(express.static(path.join(__dirname, "public")));
 // player identity instead of showing up as a stranger with no team/role.
 const rooms = new Map();
 const ROOM_TTL_MS = 20 * 60 * 1000; // clean up abandoned rooms after 20 min of no connected players
-const BOARD_SIZES = [16, 20, 25, 30];
+const BOARD_SIZES = [16, 20, 25, 30, 35, 40, 45];
 const DEFAULT_BOARD_SIZE = 25;
 
 const ROOM_CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ"; // no I/O to avoid confusion
