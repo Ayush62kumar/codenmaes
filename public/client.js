@@ -23,7 +23,8 @@
   let screen = hadStoredRoom ? "reconnecting" : "home"; // reconnecting | home | lobby | game
   let soundOn = safeGet("cn_sound") !== "off";
   let selectedTargets = new Set(); // indices the spymaster has privately marked while drafting a clue
-  let pendingGuess = null; // index the operative has tapped but not yet confirmed
+  let pendingGuesses = []; // ordered indices the operative has tapped but not yet confirmed
+  let guessQueue = null; // indices actively being submitted one-by-one after confirm
   let groupedKeyView = false; // spymaster: grouped-by-team key view instead of the shuffled grid
   let lastTurnKey = null; // detects a new turn so we can clear stale target selections
 
@@ -104,7 +105,8 @@
       selectedTargets = new Set();
     }
     if (lastTurnKey !== null && turnKey !== lastTurnKey) {
-      pendingGuess = null;
+      pendingGuesses = [];
+      guessQueue = null;
     }
     lastTurnKey = turnKey;
 
@@ -118,8 +120,35 @@
         }
       }
     }
+
+    advanceGuessQueue();
     render();
   });
+
+  // Submits the next word in a confirmed multi-select guess queue, if
+  // there is one and it's still our turn to guess. A short pause between
+  // each submission lets everyone actually see each card flip rather than
+  // the whole queue resolving instantly.
+  function advanceGuessQueue() {
+    if (!guessQueue || guessQueue.length === 0) { guessQueue = null; return; }
+    const self = me();
+    const stillMyGuess = self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess";
+    if (!stillMyGuess) { guessQueue = null; return; }
+    const next = guessQueue[0];
+    if (board[next] && board[next].revealed) {
+      // already resolved somehow (e.g. a teammate guessed it) — skip it
+      guessQueue = guessQueue.slice(1);
+      return advanceGuessQueue();
+    }
+    setTimeout(() => {
+      if (!guessQueue || guessQueue.length === 0) return;
+      const idx = guessQueue[0];
+      guessQueue = guessQueue.slice(1);
+      socket.emit("guess_word", { index: idx });
+      render();
+    }, 550);
+    render();
+  }
 
   socket.on("error_msg", (msg) => {
     if (screen === "reconnecting") {
@@ -445,16 +474,19 @@
     render();
   }
 
-  function selectPendingGuess(idx) {
+  function toggleGuessSelection(idx) {
     playClickTick();
-    pendingGuess = pendingGuess === idx ? null : idx;
+    const pos = pendingGuesses.indexOf(idx);
+    if (pos === -1) pendingGuesses = pendingGuesses.concat([idx]);
+    else pendingGuesses = pendingGuesses.slice(0, pos).concat(pendingGuesses.slice(pos + 1));
     render();
   }
 
-  function confirmGuess() {
-    if (pendingGuess === null) return;
-    socket.emit("guess_word", { index: pendingGuess });
-    pendingGuess = null;
+  function confirmGuesses() {
+    if (pendingGuesses.length === 0) return;
+    guessQueue = pendingGuesses;
+    pendingGuesses = [];
+    advanceGuessQueue();
   }
 
   function cardEl(card, idx, self) {
@@ -462,12 +494,14 @@
     const classes = ["card"];
     if (revealed) classes.push("revealed", card.color);
     const canSeeColor = card.color !== undefined && !revealed; // spymaster-only pre-reveal
+    const queueBusy = guessQueue !== null;
     const isMyTurnGuess =
-      self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && !revealed;
+      self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && !revealed && !queueBusy;
     const canMarkTarget =
       self && self.role === "spymaster" && self.team === state.turnTeam && state.phase === "clue" && !revealed;
     const isTargeted = canMarkTarget && selectedTargets.has(idx);
-    const isPending = isMyTurnGuess && pendingGuess === idx;
+    const guessOrder = pendingGuesses.indexOf(idx);
+    const isPending = guessOrder !== -1;
 
     const style = [];
     let keyBadge = null;
@@ -482,7 +516,7 @@
 
     const clickable = isMyTurnGuess || canMarkTarget;
     const onClick = isMyTurnGuess
-      ? () => selectPendingGuess(idx)
+      ? () => toggleGuessSelection(idx)
       : canMarkTarget
         ? () => toggleTarget(idx)
         : null;
@@ -497,7 +531,7 @@
       photoSwatch(card.word),
       keyBadge,
       isTargeted ? el("div", { class: "target-mark" }, "✓") : null,
-      isPending ? el("div", { class: "guess-mark" }, "✓") : null,
+      isPending ? el("div", { class: "guess-mark" }, String(guessOrder + 1)) : null,
       el("span", { class: "card-word" }, card.word),
       revealed ? el("div", { class: "stamp" }, el("span", {}, STAMP_LABEL[card.color] || "")) : null
     );
@@ -597,22 +631,26 @@
       );
     }
 
-    const myPendingGuess = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && pendingGuess !== null)
-      ? board[pendingGuess]
-      : null;
+    const isProcessingQueue = guessQueue !== null;
+    const myPendingList = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess")
+      ? pendingGuesses.map((idx) => board[idx])
+      : [];
 
     const controlsPanel = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess")
       ? el("div", { class: "panel" },
-          myPendingGuess
-            ? el("div", {},
-                el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, "Guess: ", el("b", { style: "color:var(--amber-bright);" }, myPendingGuess.word)),
-                el("div", { style: "display:flex;gap:8px;" },
-                  el("button", { class: "btn btn-primary", style: "width:auto;padding:8px 16px;", onclick: confirmGuess }, "Confirm guess"),
-                  el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => { pendingGuess = null; render(); } }, "Cancel")
+          isProcessingQueue
+            ? el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, `Submitting guesses… ${guessQueue.length} remaining.`)
+            : myPendingList.length
+              ? el("div", {},
+                  el("p", { class: "small-note", style: "text-align:left;margin:0 0 8px;" }, "Selected, in order:"),
+                  el("ol", { class: "guess-order-list" }, myPendingList.map((c) => el("li", {}, c.word))),
+                  el("div", { style: "display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;" },
+                    el("button", { class: "btn btn-primary", style: "width:auto;padding:8px 16px;", onclick: confirmGuesses }, `Confirm ${myPendingList.length} guess${myPendingList.length === 1 ? "" : "es"}`),
+                    el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => { pendingGuesses = []; render(); } }, "Clear")
+                  )
                 )
-              )
-            : el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, "Tap a word to mark it, then confirm."),
-          el("button", { class: "btn btn-ghost", style: "margin-top:10px;", onclick: () => { pendingGuess = null; socket.emit("end_turn"); } }, "End turn")
+              : el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, "Tap one or more words to queue them up, then confirm."),
+          el("button", { class: "btn btn-ghost", style: "margin-top:10px;", disabled: isProcessingQueue, onclick: () => { pendingGuesses = []; socket.emit("end_turn"); } }, "End turn")
         )
       : null;
 
