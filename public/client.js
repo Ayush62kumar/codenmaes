@@ -23,6 +23,7 @@
   let screen = hadStoredRoom ? "reconnecting" : "home"; // reconnecting | home | lobby | game
   let soundOn = safeGet("cn_sound") !== "off";
   let selectedTargets = new Set(); // indices the spymaster has privately marked while drafting a clue
+  let pendingGuess = null; // index the operative has tapped but not yet confirmed
   let groupedKeyView = false; // spymaster: grouped-by-team key view instead of the shuffled grid
   let lastTurnKey = null; // detects a new turn so we can clear stale target selections
 
@@ -102,6 +103,9 @@
     if (lastTurnKey !== null && turnKey !== lastTurnKey && state.phase === "clue") {
       selectedTargets = new Set();
     }
+    if (lastTurnKey !== null && turnKey !== lastTurnKey) {
+      pendingGuess = null;
+    }
     lastTurnKey = turnKey;
 
     // Play a sound for any card that just transitioned from hidden to revealed.
@@ -168,8 +172,9 @@
     if (!self) return null;
     const teamLabel = self.team ? self.team.toUpperCase() : "SPECTATOR";
     const roleLabel = self.role ? " · " + self.role.toUpperCase() : "";
+    const hostLabel = self.isHost ? " · HOST" : "";
     const cls = self.team === "red" ? "identity-chip red" : self.team === "blue" ? "identity-chip blue" : "identity-chip";
-    return el("div", { class: cls }, `${self.name} · ${teamLabel}${roleLabel}`);
+    return el("div", { class: cls }, `${self.name} · ${teamLabel}${roleLabel}${hostLabel}`);
   }
 
   function topbar() {
@@ -246,7 +251,7 @@
     function pill(p) {
       const away = p.connected === false;
       return el("span", { class: "player-pill" + (p.id === clientId ? " self" : "") + (away ? " away" : "") },
-        p.name + (away ? " (away)" : "")
+        p.name + (p.isHost ? " ★" : "") + (away ? " (away)" : "")
       );
     }
 
@@ -272,7 +277,7 @@
       spectators.length
         ? el("div", {}, spectators.map((p) => el("span", {
             class: "player-pill" + (p.id === clientId ? " self" : "") + (p.connected === false ? " away" : "")
-          }, p.name + (p.connected === false ? " (away)" : ""))))
+          }, p.name + (p.isHost ? " ★" : "") + (p.connected === false ? " (away)" : ""))))
         : el("span", { class: "small-note" }, "Nobody watching right now."),
       el("p", { class: "small-note", style: "margin-top:8px;text-align:left;" },
         "New players start here. Pick a team above to play, or stay here to watch."
@@ -349,16 +354,17 @@
       el("p", { class: "hint" }, "Share room code ", el("b", {}, roomCode), " with your team. Each side needs one spymaster and at least one operative."),
       errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null,
       el("div", { class: "teams-grid" }, teamDossier("red"), teamDossier("blue")),
-      self && self.team ? el("div", { class: "lobby-controls", style: "margin-bottom:20px;" },
-        el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => socket.emit("become_spectator") }, "Become spectator")
-      ) : null,
+      el("div", { class: "lobby-controls", style: "margin-bottom:20px;gap:10px;" },
+        el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => socket.emit("randomize_teams") }, "🎲 Randomize teams"),
+        self && self.team ? el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => socket.emit("become_spectator") }, "Become spectator") : null
+      ),
       spectatorsPanel(),
       boardSizePanel(),
       wordPoolPanel(),
       el("div", { class: "lobby-controls" },
         el("button", { class: "btn btn-primary", onclick: () => socket.emit("start_game") }, "Brief the teams (start game)")
       ),
-      el("p", { class: "small-note" }, self ? `You are ${self.name}${self.team ? " · " + self.team.toUpperCase() : " · SPECTATOR"}${self.role ? " · " + self.role : ""}` : "")
+      el("p", { class: "small-note" }, self ? `You are ${self.name}${self.isHost ? " (Host)" : ""}${self.team ? " · " + self.team.toUpperCase() : " · SPECTATOR"}${self.role ? " · " + self.role : ""}` : "")
     );
     return wrap;
   }
@@ -439,6 +445,18 @@
     render();
   }
 
+  function selectPendingGuess(idx) {
+    playClickTick();
+    pendingGuess = pendingGuess === idx ? null : idx;
+    render();
+  }
+
+  function confirmGuess() {
+    if (pendingGuess === null) return;
+    socket.emit("guess_word", { index: pendingGuess });
+    pendingGuess = null;
+  }
+
   function cardEl(card, idx, self) {
     const revealed = card.revealed;
     const classes = ["card"];
@@ -449,6 +467,7 @@
     const canMarkTarget =
       self && self.role === "spymaster" && self.team === state.turnTeam && state.phase === "clue" && !revealed;
     const isTargeted = canMarkTarget && selectedTargets.has(idx);
+    const isPending = isMyTurnGuess && pendingGuess === idx;
 
     const style = [];
     let keyBadge = null;
@@ -459,10 +478,11 @@
       keyBadge = el("div", { class: "key-badge key-badge-" + card.color }, COLOR_LETTER[card.color]);
     }
     if (isTargeted) classes.push("targeted");
+    if (isPending) classes.push("pending-guess");
 
     const clickable = isMyTurnGuess || canMarkTarget;
     const onClick = isMyTurnGuess
-      ? () => { playClickTick(); socket.emit("guess_word", { index: idx }); }
+      ? () => selectPendingGuess(idx)
       : canMarkTarget
         ? () => toggleTarget(idx)
         : null;
@@ -477,6 +497,7 @@
       photoSwatch(card.word),
       keyBadge,
       isTargeted ? el("div", { class: "target-mark" }, "✓") : null,
+      isPending ? el("div", { class: "guess-mark" }, "✓") : null,
       el("span", { class: "card-word" }, card.word),
       revealed ? el("div", { class: "stamp" }, el("span", {}, STAMP_LABEL[card.color] || "")) : null
     );
@@ -576,15 +597,31 @@
       );
     }
 
+    const myPendingGuess = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess" && pendingGuess !== null)
+      ? board[pendingGuess]
+      : null;
+
     const controlsPanel = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess")
       ? el("div", { class: "panel" },
-          el("button", { class: "btn btn-ghost", onclick: () => socket.emit("end_turn") }, "End turn")
+          myPendingGuess
+            ? el("div", {},
+                el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, "Guess: ", el("b", { style: "color:var(--amber-bright);" }, myPendingGuess.word)),
+                el("div", { style: "display:flex;gap:8px;" },
+                  el("button", { class: "btn btn-primary", style: "width:auto;padding:8px 16px;", onclick: confirmGuess }, "Confirm guess"),
+                  el("button", { class: "btn btn-ghost", style: "width:auto;padding:8px 16px;", onclick: () => { pendingGuess = null; render(); } }, "Cancel")
+                )
+              )
+            : el("p", { class: "small-note", style: "text-align:left;margin:0 0 10px;" }, "Tap a word to mark it, then confirm."),
+          el("button", { class: "btn btn-ghost", style: "margin-top:10px;", onclick: () => { pendingGuess = null; socket.emit("end_turn"); } }, "End turn")
         )
       : null;
 
     const endGamePanel = (!ended && self && self.team)
       ? el("div", { class: "panel" },
-          el("button", { class: "btn btn-ghost danger", onclick: onEndGame }, "End game")
+          el("button", { class: "btn btn-ghost danger", onclick: onEndGame }, "End game"),
+          state.hostId && state.hostId !== self.id
+            ? el("p", { class: "small-note", style: "margin-top:6px;" }, "Only the host can end the game while they're connected.")
+            : null
         )
       : null;
 

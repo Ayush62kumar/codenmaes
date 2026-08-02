@@ -117,6 +117,7 @@ function createRoom(code) {
     winner: null,
     customWords, // extra words players add on top of the base word bank
     onlyCustomWords: false, // if true (and enough custom words), skip the base bank entirely
+    hostClientId: null, // the player who created the room — has authority to end the game
     createdAt: Date.now(),
     lastActivity: Date.now(),
   };
@@ -143,12 +144,14 @@ function publicState(room) {
     onlyCustomWords: room.onlyCustomWords,
     boardSize: room.boardSize,
     boardSizeOptions: BOARD_SIZES,
+    hostId: room.hostClientId,
     players: Array.from(room.players.values()).map((p) => ({
       id: p.clientId,
       name: p.name,
       team: p.team,
       role: p.role,
       connected: p.connected,
+      isHost: p.clientId === room.hostClientId,
     })),
   };
 }
@@ -255,6 +258,7 @@ io.on("connection", (socket) => {
     if (!clientId) return socket.emit("error_msg", "Missing client id.");
     const code = makeRoomCode();
     const room = createRoom(code);
+    room.hostClientId = clientId;
     joinOrCreate(room, { name, clientId });
   });
 
@@ -332,6 +336,25 @@ io.on("connection", (socket) => {
       const n = parseInt(size, 10);
       if (!BOARD_SIZES.includes(n)) return;
       room.boardSize = n;
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on("randomize_teams", () => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "lobby") return;
+      const players = shuffle(Array.from(room.players.values()));
+      const half = Math.ceil(players.length / 2);
+      let redSpySet = false, blueSpySet = false;
+      players.forEach((pl, i) => {
+        pl.team = i < half ? "red" : "blue";
+      });
+      players.forEach((pl) => {
+        if (pl.team === "red") { pl.role = redSpySet ? "operative" : "spymaster"; redSpySet = true; }
+        else { pl.role = blueSpySet ? "operative" : "spymaster"; blueSpySet = true; }
+      });
+      pushLog(room, `${p.name} randomized the teams.`);
       broadcastRoom(room);
     });
   });
@@ -431,9 +454,15 @@ io.on("connection", (socket) => {
     getRoomOr((room) => {
       const p = getMe(room);
       if (!p || room.phase === "lobby" || room.phase === "ended") return;
+      const host = room.players.get(room.hostClientId);
+      const hostPresent = host && host.connected;
+      const isHost = p.clientId === room.hostClientId;
+      if (hostPresent && !isHost) {
+        return socket.emit("error_msg", "Only the room host can end the game.");
+      }
       room.phase = "ended";
       room.winner = null; // aborted, no winner
-      pushLog(room, `${p.name} ended the game early.`);
+      pushLog(room, `${p.name}${isHost ? " (host)" : ""} ended the game early.`);
       broadcastRoom(room);
     });
   });
