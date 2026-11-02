@@ -290,10 +290,20 @@
 
     function pill(p) {
       const away = p.connected === false;
+      if (p.isBot) {
+        return el("span", { class: "player-pill bot" },
+          "🤖 " + p.name + " ",
+          el("button", { class: "pill-x", title: "Remove AI player", type: "button", onclick: () => socket.emit("remove_bot", { id: p.id }) }, "×")
+        );
+      }
       return el("span", { class: "player-pill" + (p.id === clientId ? " self" : "") + (away ? " away" : "") },
         p.name + (p.isHost ? " ★" : "") + (away ? " (away)" : "")
       );
     }
+
+    const hasBot = (role) => players.some((p) => p.isBot && p.role === role);
+    const aiOn = !!state.aiEnabled;
+    const aiTitle = aiOn ? "" : "Set ANTHROPIC_API_KEY on the server to enable AI players";
 
     return el("div", { class: "team-dossier" + (team === "blue" ? " blue" : "") },
       el("h2", {}, label),
@@ -306,6 +316,16 @@
       el("div", { class: "join-row" },
         el("button", { class: "btn btn-ghost", onclick: () => setTeamRole(team, "spymaster") }, "Be spymaster"),
         el("button", { class: "btn btn-ghost", onclick: () => setTeamRole(team, "operative") }, "Be operative")
+      ),
+      el("div", { class: "join-row" },
+        el("button", {
+          class: "btn btn-ghost ai-btn", title: aiTitle, disabled: !aiOn || hasBot("spymaster") || spymasters.length > 0,
+          onclick: () => socket.emit("add_bot", { team, role: "spymaster" }),
+        }, "🤖 AI spymaster"),
+        el("button", {
+          class: "btn btn-ghost ai-btn", title: aiTitle, disabled: !aiOn || hasBot("operative"),
+          onclick: () => socket.emit("add_bot", { team, role: "operative" }),
+        }, "🤖 AI operative")
       )
     );
   }
@@ -392,6 +412,9 @@
     const self = me();
     const wrap = el("div", { class: "lobby-wrap" },
       el("p", { class: "hint" }, "Share room code ", el("b", {}, roomCode), " with your team. Each side needs one spymaster and at least one operative."),
+      !state.aiEnabled
+        ? el("p", { class: "small-note", style: "text-align:left;" }, "AI players are off. Set ANTHROPIC_API_KEY on the server to let an AI fill any spymaster or operative seat.")
+        : el("p", { class: "small-note", style: "text-align:left;" }, "Short on players? Add an AI spymaster or operative to any team. An AI operative steps aside whenever a human operative is on its team."),
       errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null,
       el("div", { class: "teams-grid" }, teamDossier("red"), teamDossier("blue")),
       el("div", { class: "lobby-controls", style: "margin-bottom:20px;gap:10px;" },
@@ -638,9 +661,18 @@
     } else {
       cluePanel = el("div", { class: "panel" },
         el("h3", {}, "Current clue"),
-        el("div", { class: "clue-empty" }, ended ? "Case closed." : "Waiting on spymaster…")
+        el("div", { class: "clue-empty" }, ended ? "Case closed." : state.aiThinking ? "AI spymaster is thinking…" : "Waiting on spymaster…")
       );
     }
+
+    const aiStatus = !ended && state.aiThinking
+      ? el("div", { class: "panel ai-status" }, "🤖 AI is thinking…")
+      : !ended && state.aiFailed
+        ? el("div", { class: "panel ai-status ai-failed" },
+            el("p", { class: "small-note", style: "text-align:left;margin:0 0 8px;" }, "The AI couldn't make its move."),
+            el("button", { class: "btn btn-primary", style: "width:auto;padding:8px 16px;", onclick: () => socket.emit("ai_retry") }, "Retry AI")
+          )
+        : null;
 
     const isProcessingQueue = guessQueue !== null;
     const myPendingList = (!ended && self && self.role === "operative" && self.team === state.turnTeam && state.phase === "guess")
@@ -688,7 +720,7 @@
       el("ul", { class: "log-list" }, (state.log || []).map((l) => el("li", {}, l.text)))
     );
 
-    const sidebar = el("div", { class: "sidebar" }, cluePanel, controlsPanel, endGamePanel, rolePanel, logPanel);
+    const sidebar = el("div", { class: "sidebar" }, cluePanel, aiStatus, controlsPanel, endGamePanel, rolePanel, logPanel);
 
     const wrap = el("div", { class: "game-wrap" },
       scoreboard,

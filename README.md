@@ -41,6 +41,34 @@ multiple players.
    word ends the turn; the assassin ends the game instantly.
 6. First team to reveal all their words wins.
 
+## AI players
+
+Any empty seat can be filled by an AI. In the lobby, each team has
+**🤖 AI spymaster** and **🤖 AI operative** buttons.
+
+- **AI spymaster** sees the key (server-side only), and gives a one-word clue
+  plus a number. Every clue is validated before it is used: single word, not on
+  the board, not a substring/superstring of a board word, sensible number. An
+  illegal clue is sent back to the model for up to 3 attempts.
+- **AI operative** only sees what a human operative sees (hidden words, the
+  clue, revealed cards and past turns) and guesses in order of confidence.
+  It steps aside automatically whenever a human operative is on its team.
+- If the AI call fails (outage, bad output), the game shows a **Retry AI**
+  button instead of freezing.
+
+Enable it by setting an API key before starting the server:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+# optional: AI_MODEL=claude-sonnet-5-5 (default)
+npm start
+```
+
+On Render/Railway add `ANTHROPIC_API_KEY` as an environment variable. Without
+a key the game works exactly as before and the AI buttons stay disabled. The
+key stays on the server and is never sent to browsers. Code lives in `ai.js`
+(prompts, validation) and the "AI players" section of `server.js`.
+
 ## Deploying so others can join from anywhere
 
 Any host that runs a persistent Node.js process works (this app needs

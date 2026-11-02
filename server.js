@@ -3,6 +3,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const WORDS = require("./words");
+const ai = require("./ai");
 
 const app = express();
 const server = http.createServer(app);
@@ -126,6 +127,10 @@ function createRoom(code) {
     guessesLeft: 0,
     guessesMade: 0,
     log: [],
+    history: [], // [{team, word, number, guesses: [{word, color}]}] — public info, fed to AI players
+    epoch: 0, // bumped whenever the turn/game changes, so stale AI work can detect it and bail out
+    botBusy: false, // an AI player is currently thinking/acting
+    botFailedEpoch: null, // epoch in which the AI failed; blocks auto-retry until someone clicks Retry
     winner: null,
     customWords, // extra words players add on top of the base word bank
     onlyCustomWords: false, // if true (and enough custom words), skip the base bank entirely
@@ -157,12 +162,16 @@ function publicState(room) {
     boardSize: room.boardSize,
     boardSizeOptions: BOARD_SIZES,
     hostId: room.hostClientId,
+    aiEnabled: ai.isEnabled(),
+    aiThinking: room.botBusy,
+    aiFailed: room.botFailedEpoch !== null && room.botFailedEpoch === room.epoch,
     players: Array.from(room.players.values()).map((p) => ({
       id: p.clientId,
       name: p.name,
       team: p.team,
       role: p.role,
       connected: p.connected,
+      isBot: !!p.isBot,
       isHost: p.clientId === room.hostClientId,
     })),
   };
@@ -185,6 +194,7 @@ function broadcastRoom(room) {
     if (!player.connected || !player.socketId) continue;
     io.to(player.socketId).emit("room_update", { state, board: boardFor(room, player) });
   }
+  scheduleBot(room);
 }
 
 function pushLog(room, text) {
@@ -209,6 +219,151 @@ function switchTurn(room) {
   room.clue = null;
   room.guessesLeft = 0;
   room.guessesMade = 0;
+  room.epoch++;
+}
+
+// ---- Shared game actions (used by both human sockets and AI players) -------
+function doGiveClue(room, word, number, actor) {
+  const n = Math.max(0, Math.min(9, parseInt(number, 10) || 0));
+  room.clue = { word: (word || "").slice(0, 40), number: n };
+  room.guessesLeft = n === 0 ? 999 : n + 1; // 0 = unlimited guesses ("infinity" clue handled as big number)
+  room.guessesMade = 0;
+  room.phase = "guess";
+  room.history.push({ team: room.turnTeam, word: room.clue.word, number: n, guesses: [] });
+  pushLog(room, `${room.turnTeam.toUpperCase()} spymaster's clue: "${room.clue.word}" — ${n}`);
+  broadcastRoom(room);
+}
+
+function doGuess(room, index, actor) {
+  const card = room.board[index];
+  if (!card || card.revealed) return;
+  card.revealed = true;
+  room.guessesMade += 1;
+  const entry = room.history[room.history.length - 1];
+  if (entry) entry.guesses.push({ word: card.word, color: card.color });
+
+  if (card.color === "assassin") {
+    pushLog(room, `${actor.name} revealed "${card.word}" — the ASSASSIN! ${room.turnTeam.toUpperCase()} loses.`);
+    room.phase = "ended";
+    room.winner = room.turnTeam === "red" ? "blue" : "red";
+    return broadcastRoom(room);
+  }
+
+  pushLog(room, `${actor.name} revealed "${card.word}" (${card.color}).`);
+
+  checkWin(room);
+  if (room.phase === "ended") return broadcastRoom(room);
+
+  if (card.color !== room.turnTeam) {
+    // wrong team or neutral: turn ends
+    switchTurn(room);
+    return broadcastRoom(room);
+  }
+
+  // correct guess
+  room.guessesLeft -= 1;
+  if (room.guessesLeft <= 0) {
+    switchTurn(room);
+  }
+  broadcastRoom(room);
+}
+
+function doEndTurn(room) {
+  pushLog(room, `${room.turnTeam.toUpperCase()} ended their turn.`);
+  switchTurn(room);
+  broadcastRoom(room);
+}
+
+// ---- AI players -------------------------------------------------------------
+// A bot is a normal entry in room.players (isBot: true, never connected via a
+// socket). When it is a bot's turn to act, the server asks the LLM, validates
+// the answer, and then plays through the same doGiveClue/doGuess/doEndTurn
+// functions as a human would. The key (card colors) is only ever used here, on
+// the server, and only for the spymaster bot's prompt.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BOT_GUESS_DELAY_MS = parseInt(process.env.BOT_DELAY_MS, 10) || 1400;
+
+function findBot(room, team, role) {
+  return Array.from(room.players.values()).find((p) => p.isBot && p.team === team && p.role === role);
+}
+
+function clueContext(room) {
+  const hidden = room.board.filter((c) => !c.revealed);
+  const words = (color) => hidden.filter((c) => c.color === color).map((c) => c.word);
+  const opp = room.turnTeam === "red" ? "blue" : "red";
+  return {
+    team: room.turnTeam,
+    own: words(room.turnTeam),
+    opponent: words(opp),
+    neutral: words("neutral"),
+    assassin: words("assassin"),
+    hidden: hidden.map((c) => c.word),
+    history: room.history,
+  };
+}
+
+function guessContext(room) {
+  const hidden = room.board.filter((c) => !c.revealed).map((c) => c.word);
+  return {
+    team: room.turnTeam,
+    clue: room.clue,
+    maxGuesses: Math.min(room.guessesLeft, 9, hidden.length),
+    hidden,
+    revealed: room.board.filter((c) => c.revealed).map((c) => ({ word: c.word, color: c.color })),
+    history: room.history,
+  };
+}
+
+async function runBot(room, bot) {
+  const epoch = room.epoch;
+  const stale = (phase) => room.epoch !== epoch || room.phase !== phase;
+  try {
+    if (room.phase === "clue") {
+      const { clue, number } = await ai.generateClue(clueContext(room));
+      if (stale("clue")) return;
+      doGiveClue(room, clue, number, bot);
+    } else if (room.phase === "guess") {
+      const picks = await ai.generateGuesses(guessContext(room));
+      for (const word of picks) {
+        await sleep(BOT_GUESS_DELAY_MS); // let the table watch each card flip
+        if (stale("guess")) return;
+        const idx = room.board.findIndex((c) => !c.revealed && c.word === word);
+        if (idx !== -1) doGuess(room, idx, bot);
+      }
+      if (!stale("guess")) {
+        await sleep(BOT_GUESS_DELAY_MS);
+        if (!stale("guess")) doEndTurn(room);
+      }
+    }
+  } catch (err) {
+    console.error(`[ai] ${bot.name} failed in room ${room.code}:`, err.message);
+    room.botFailedEpoch = epoch;
+    pushLog(room, `${bot.name} couldn't act (${String(err.message).slice(0, 120)}). Click "Retry AI" to try again.`);
+  } finally {
+    room.botBusy = false;
+    broadcastRoom(room); // also lets the next bot in line (e.g. the other team's) start
+  }
+}
+
+function scheduleBot(room) {
+  if (room.botBusy || !ai.isEnabled()) return;
+  if (room.phase !== "clue" && room.phase !== "guess") return;
+  if (room.botFailedEpoch === room.epoch) return;
+  const role = room.phase === "clue" ? "spymaster" : "operative";
+  const bot = findBot(room, room.turnTeam, role);
+  if (!bot) return;
+  if (role === "operative") {
+    // An AI operative fills an empty seat; it steps aside when a human operative is on the team.
+    const humanOperative = Array.from(room.players.values()).some(
+      (p) => !p.isBot && p.connected && p.team === room.turnTeam && p.role === "operative"
+    );
+    if (humanOperative) return;
+  }
+  room.botBusy = true;
+  setImmediate(() => {
+    runBot(room, bot);
+    broadcastRoom(room); // shows "AI is thinking…" (scheduleBot is a no-op now: botBusy is set)
+  });
 }
 
 // Periodically clean up rooms nobody is connected to anymore, giving
@@ -216,7 +371,7 @@ function switchTurn(room) {
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms.entries()) {
-    const anyoneConnected = Array.from(room.players.values()).some((p) => p.connected);
+    const anyoneConnected = Array.from(room.players.values()).some((p) => p.connected && !p.isBot);
     if (!anyoneConnected && now - room.lastActivity > ROOM_TTL_MS) {
       rooms.delete(code);
     }
@@ -295,6 +450,14 @@ io.on("connection", (socket) => {
       const p = getMe(room);
       if (!p) return;
       p.role = role;
+      // A human taking the spymaster seat replaces that team's AI spymaster.
+      if (role === "spymaster" && p.team) {
+        const bot = findBot(room, p.team, "spymaster");
+        if (bot) {
+          room.players.delete(bot.clientId);
+          pushLog(room, `${bot.name} stepped down for ${p.name}.`);
+        }
+      }
       broadcastRoom(room);
     });
   });
@@ -356,9 +519,11 @@ io.on("connection", (socket) => {
     getRoomOr((room) => {
       const p = getMe(room);
       if (!p || room.phase !== "lobby") return;
-      const players = shuffle(Array.from(room.players.values()));
+      // AI players keep their seats; only humans are shuffled around them.
+      const players = shuffle(Array.from(room.players.values()).filter((x) => !x.isBot));
       const half = Math.ceil(players.length / 2);
-      let redSpySet = false, blueSpySet = false;
+      let redSpySet = !!findBot(room, "red", "spymaster");
+      let blueSpySet = !!findBot(room, "blue", "spymaster");
       players.forEach((pl, i) => {
         pl.team = i < half ? "red" : "blue";
       });
@@ -395,6 +560,9 @@ io.on("connection", (socket) => {
       room.guessesMade = 0;
       room.winner = null;
       room.log = [];
+      room.history = [];
+      room.epoch++;
+      room.botFailedEpoch = null;
       pushLog(room, room.onlyCustomWords
         ? `New game (${room.boardSize} cards) using only the custom word pool. ${starter.toUpperCase()} goes first.`
         : `New game (${room.boardSize} cards). ${starter.toUpperCase()} goes first.`);
@@ -406,13 +574,7 @@ io.on("connection", (socket) => {
     getRoomOr((room) => {
       const p = getMe(room);
       if (!p || p.role !== "spymaster" || p.team !== room.turnTeam || room.phase !== "clue") return;
-      const n = Math.max(0, Math.min(9, parseInt(number, 10) || 0));
-      room.clue = { word: (word || "").slice(0, 40), number: n };
-      room.guessesLeft = n === 0 ? 999 : n + 1; // 0 = unlimited guesses ("infinity" clue handled as big number)
-      room.guessesMade = 0;
-      room.phase = "guess";
-      pushLog(room, `${room.turnTeam.toUpperCase()} spymaster's clue: "${room.clue.word}" — ${n}`);
-      broadcastRoom(room);
+      doGiveClue(room, word, number, p);
     });
   });
 
@@ -420,35 +582,7 @@ io.on("connection", (socket) => {
     getRoomOr((room) => {
       const p = getMe(room);
       if (!p || p.role !== "operative" || p.team !== room.turnTeam || room.phase !== "guess") return;
-      const card = room.board[index];
-      if (!card || card.revealed) return;
-      card.revealed = true;
-      room.guessesMade += 1;
-
-      if (card.color === "assassin") {
-        pushLog(room, `${p.name} revealed "${card.word}" — the ASSASSIN! ${room.turnTeam.toUpperCase()} loses.`);
-        room.phase = "ended";
-        room.winner = room.turnTeam === "red" ? "blue" : "red";
-        return broadcastRoom(room);
-      }
-
-      pushLog(room, `${p.name} revealed "${card.word}" (${card.color}).`);
-
-      checkWin(room);
-      if (room.phase === "ended") return broadcastRoom(room);
-
-      if (card.color !== room.turnTeam) {
-        // wrong team or neutral: turn ends
-        switchTurn(room);
-        return broadcastRoom(room);
-      }
-
-      // correct guess
-      room.guessesLeft -= 1;
-      if (room.guessesLeft <= 0) {
-        switchTurn(room);
-      }
-      broadcastRoom(room);
+      doGuess(room, index, p);
     });
   });
 
@@ -456,8 +590,48 @@ io.on("connection", (socket) => {
     getRoomOr((room) => {
       const p = getMe(room);
       if (!p || p.team !== room.turnTeam || room.phase !== "guess") return;
-      pushLog(room, `${room.turnTeam.toUpperCase()} ended their turn.`);
-      switchTurn(room);
+      doEndTurn(room);
+    });
+  });
+
+  // ---- AI players (lobby only) ----
+  socket.on("add_bot", ({ team, role }) => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      if (!p || room.phase !== "lobby") return;
+      if (!["red", "blue"].includes(team) || !["spymaster", "operative"].includes(role)) return;
+      if (!ai.isEnabled()) {
+        return socket.emit("error_msg", "AI players are not configured on this server. Set the ANTHROPIC_API_KEY environment variable and restart.");
+      }
+      if (findBot(room, team, role)) return socket.emit("error_msg", `${team.toUpperCase()} already has an AI ${role}.`);
+      if (role === "spymaster") {
+        const humanSpy = Array.from(room.players.values()).some((x) => !x.isBot && x.team === team && x.role === "spymaster");
+        if (humanSpy) return socket.emit("error_msg", `${team.toUpperCase()} already has a human spymaster.`);
+      }
+      const id = "bot-" + Math.random().toString(36).slice(2, 10);
+      const name = role === "spymaster" ? "Cipher (AI)" : "Scout (AI)";
+      room.players.set(id, { clientId: id, socketId: null, name, team, role, connected: true, isBot: true });
+      pushLog(room, `${p.name} added an AI ${role} to ${team.toUpperCase()}.`);
+      broadcastRoom(room);
+    });
+  });
+
+  socket.on("remove_bot", ({ id }) => {
+    getRoomOr((room) => {
+      const p = getMe(room);
+      const bot = room.players.get(id);
+      if (!p || !bot || !bot.isBot || room.phase !== "lobby") return;
+      room.players.delete(id);
+      pushLog(room, `${p.name} removed ${bot.name} from ${bot.team.toUpperCase()}.`);
+      broadcastRoom(room);
+    });
+  });
+
+  // If an AI stalled (API error, bad output), anyone can ask it to try again.
+  socket.on("ai_retry", () => {
+    getRoomOr((room) => {
+      if (!getMe(room)) return;
+      room.botFailedEpoch = null;
       broadcastRoom(room);
     });
   });
@@ -473,6 +647,7 @@ io.on("connection", (socket) => {
         return socket.emit("error_msg", "Only the room host can end the game.");
       }
       room.phase = "ended";
+      room.epoch++;
       room.winner = null; // aborted, no winner
       pushLog(room, `${p.name}${isHost ? " (host)" : ""} ended the game early.`);
       broadcastRoom(room);
@@ -491,6 +666,9 @@ io.on("connection", (socket) => {
       room.guessesMade = 0;
       room.winner = null;
       room.log = [];
+      room.history = [];
+      room.epoch++;
+      room.botFailedEpoch = null;
       pushLog(room, `New game. ${starter.toUpperCase()} goes first.`);
       broadcastRoom(room);
     });
@@ -501,6 +679,7 @@ io.on("connection", (socket) => {
       const p = getMe(room);
       if (!p || room.phase !== "ended") return;
       room.phase = "lobby";
+      room.epoch++;
       room.clue = null;
       room.winner = null;
       broadcastRoom(room);
