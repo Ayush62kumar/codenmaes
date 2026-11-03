@@ -56,18 +56,29 @@ Any empty seat can be filled by an AI. In the lobby, each team has
 - If the AI call fails (outage, bad output), the game shows a **Retry AI**
   button instead of freezing.
 
-Enable it by setting an API key before starting the server:
+Pick one provider and set its key before starting the server:
 
 ```bash
+# Free option: Google Gemini (get a key at https://aistudio.google.com/apikey)
+export GEMINI_API_KEY=your-key
+# optional: AI_MODEL=gemini-3.8-flash  (default: tries gemini-3.8-flash, then older ones;
+#           check AI Studio for which models are free for you)
+
+# or Anthropic (paid, pay-as-you-go)
 export ANTHROPIC_API_KEY=sk-ant-...
-# optional: AI_MODEL=claude-sonnet-5-5 (default)
+# optional: AI_MODEL=claude-sonnet-5-5
+
 npm start
 ```
 
-On Render/Railway add `ANTHROPIC_API_KEY` as an environment variable. Without
-a key the game works exactly as before and the AI buttons stay disabled. The
-key stays on the server and is never sent to browsers. Code lives in `ai.js`
-(prompts, validation) and the "AI players" section of `server.js`.
+If both keys are set, Gemini is used; force one with `PROVIDER=gemini` or
+`PROVIDER=anthropic`. On Render/Railway add the key as an environment variable
+and redeploy. Free tiers have rate limits (and may change), so if the AI ever
+shows "Retry AI" with a 429 error in the server log, wait a minute and retry.
+Without a key the game works exactly as before and the AI buttons stay
+disabled. The key stays on the server and is never sent to browsers. Code lives
+in `ai.js` (providers, prompts, validation) and the "AI players" section of
+`server.js`.
 
 ## Deploying so others can join from anywhere
 

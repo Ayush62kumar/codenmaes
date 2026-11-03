@@ -1,20 +1,39 @@
 // AI helpers for Codenames bots (spymaster + operative).
 //
-// Talks to the Anthropic Messages API with plain fetch (Node >= 18), so no
-// extra dependency is needed. Configure with environment variables:
-//   ANTHROPIC_API_KEY  (required to enable AI players)
-//   AI_MODEL           (optional, default below)
+// Talks to an LLM API with plain fetch (Node >= 18), so no extra dependency
+// is needed. Two providers are supported; configure with environment variables:
+//   Gemini (has a free tier):  GEMINI_API_KEY   (+ optional AI_MODEL)
+//   Anthropic:                 ANTHROPIC_API_KEY (+ optional AI_MODEL)
+//   PROVIDER=gemini|anthropic  (optional; auto-detected from whichever key is set)
 //
 // Everything the model returns is treated as untrusted: clues are validated
 // against the board before being used, and guesses are matched against the
 // words that are actually still hidden.
 
-const API_URL = "https://api.anthropic.com/v1/messages";
-const DEFAULT_MODEL = "claude-sonnet-5-5";
+const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
+const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-5-5";
+// Tried in order when AI_MODEL is not set. Google retires models regularly, so if one
+// returns 404 ("no longer available") we move on to the next and remember what worked.
+const GEMINI_MODEL_FALLBACKS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
+let geminiWorkingModel = null;
 const REQUEST_TIMEOUT_MS = 45000;
 
-async function defaultCompleter({ system, user, maxTokens }) {
-  const res = await fetch(API_URL, {
+function geminiKey() {
+  return process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+}
+
+// Which provider to use: explicit PROVIDER wins, otherwise whichever key exists.
+function provider() {
+  const explicit = (process.env.PROVIDER || "").toLowerCase();
+  if (explicit === "gemini" || explicit === "anthropic") return explicit;
+  if (geminiKey()) return "gemini";
+  if (process.env.ANTHROPIC_API_KEY) return "anthropic";
+  return null;
+}
+
+async function anthropicCompleter({ system, user, maxTokens }) {
+  const res = await fetch(ANTHROPIC_URL, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -22,7 +41,7 @@ async function defaultCompleter({ system, user, maxTokens }) {
       "anthropic-version": "2023-06-01",
     },
     body: JSON.stringify({
-      model: process.env.AI_MODEL || DEFAULT_MODEL,
+      model: process.env.AI_MODEL || DEFAULT_ANTHROPIC_MODEL,
       max_tokens: maxTokens || 400,
       system,
       messages: [{ role: "user", content: user }],
@@ -37,6 +56,89 @@ async function defaultCompleter({ system, user, maxTokens }) {
   return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
 }
 
+async function geminiRequest(model, { system, user, maxTokens }) {
+  const generationConfig = {
+    // Headroom: on "thinking" models, reasoning tokens count against this limit.
+    maxOutputTokens: Math.max(1024, (maxTokens || 400) * 3),
+    responseMimeType: "application/json",
+  };
+  // Thinking isn't needed for these short answers; turn it off where supported (2.5 Flash).
+  if (/2\.5-flash/.test(model)) generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  const res = await fetch(`${GEMINI_BASE}/${encodeURIComponent(model)}:generateContent`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-goog-api-key": geminiKey() },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: [{ role: "user", parts: [{ text: user }] }],
+      generationConfig,
+    }),
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const err = new Error(`Gemini API ${res.status} (${model}): ${body.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
+  }
+  const data = await res.json();
+  const parts = (data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [];
+  const text = parts.map((p) => p.text || "").join("");
+  if (!text) {
+    const why = (data.candidates && data.candidates[0] && data.candidates[0].finishReason) ||
+      (data.promptFeedback && data.promptFeedback.blockReason) || "empty response";
+    throw new Error(`Gemini returned no text (${why})`);
+  }
+  return text;
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const TRANSIENT = new Set([500, 502, 503, 504]); // overloaded / temporary: worth retrying
+const SKIP_MODEL = new Set([404, 429]);          // retired or out of quota: try a different model
+
+// One model, with a short retry on temporary overload errors.
+async function geminiWithRetry(model, args, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await geminiRequest(model, args);
+    } catch (err) {
+      lastErr = err;
+      if (!TRANSIENT.has(err.status) || i === attempts - 1) throw err;
+      await wait(1500 * (i + 1)); // 1.5s, 3s
+    }
+  }
+  throw lastErr;
+}
+
+async function geminiCompleter(args) {
+  if (process.env.AI_MODEL) return geminiWithRetry(process.env.AI_MODEL, args);
+  // Start with the model that last worked, then the rest of the list.
+  const order = geminiWorkingModel
+    ? [geminiWorkingModel, ...GEMINI_MODEL_FALLBACKS.filter((m) => m !== geminiWorkingModel)]
+    : GEMINI_MODEL_FALLBACKS;
+  let lastErr;
+  for (const model of order) {
+    try {
+      const text = await geminiWithRetry(model, args, 2);
+      geminiWorkingModel = model;
+      return text;
+    } catch (err) {
+      lastErr = err;
+      const modelProblem = SKIP_MODEL.has(err.status) || TRANSIENT.has(err.status) ||
+        (err.status === 400 && /model/i.test(err.message));
+      if (!modelProblem) throw err; // e.g. bad API key: another model won't help
+    }
+  }
+  throw lastErr;
+}
+
+async function defaultCompleter(args) {
+  const p = provider();
+  if (p === "gemini") return geminiCompleter(args);
+  if (p === "anthropic") return anthropicCompleter(args);
+  throw new Error("No AI provider configured");
+}
+
 let completer = defaultCompleter;
 
 // Tests swap in a fake model with this.
@@ -45,7 +147,7 @@ function setCompleter(fn) {
 }
 
 function isEnabled() {
-  return completer !== defaultCompleter || !!process.env.ANTHROPIC_API_KEY;
+  return completer !== defaultCompleter || provider() !== null;
 }
 
 function extractJson(text) {

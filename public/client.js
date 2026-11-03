@@ -303,7 +303,7 @@
 
     const hasBot = (role) => players.some((p) => p.isBot && p.role === role);
     const aiOn = !!state.aiEnabled;
-    const aiTitle = aiOn ? "" : "Set ANTHROPIC_API_KEY on the server to enable AI players";
+    const aiTitle = aiOn ? "" : "Set GEMINI_API_KEY (free) or ANTHROPIC_API_KEY on the server to enable AI players";
 
     return el("div", { class: "team-dossier" + (team === "blue" ? " blue" : "") },
       el("h2", {}, label),
@@ -413,7 +413,7 @@
     const wrap = el("div", { class: "lobby-wrap" },
       el("p", { class: "hint" }, "Share room code ", el("b", {}, roomCode), " with your team. Each side needs one spymaster and at least one operative."),
       !state.aiEnabled
-        ? el("p", { class: "small-note", style: "text-align:left;" }, "AI players are off. Set ANTHROPIC_API_KEY on the server to let an AI fill any spymaster or operative seat.")
+        ? el("p", { class: "small-note", style: "text-align:left;" }, "AI players are off. Set GEMINI_API_KEY (free tier available) or ANTHROPIC_API_KEY on the server and restart it to let an AI fill any seat.")
         : el("p", { class: "small-note", style: "text-align:left;" }, "Short on players? Add an AI spymaster or operative to any team. An AI operative steps aside whenever a human operative is on its team."),
       errorMsg ? el("div", { class: "error-banner" }, errorMsg) : null,
       el("div", { class: "teams-grid" }, teamDossier("red"), teamDossier("blue")),

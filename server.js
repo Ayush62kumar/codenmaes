@@ -601,7 +601,7 @@ io.on("connection", (socket) => {
       if (!p || room.phase !== "lobby") return;
       if (!["red", "blue"].includes(team) || !["spymaster", "operative"].includes(role)) return;
       if (!ai.isEnabled()) {
-        return socket.emit("error_msg", "AI players are not configured on this server. Set the ANTHROPIC_API_KEY environment variable and restart.");
+        return socket.emit("error_msg", "AI players are not configured on this server. Set GEMINI_API_KEY (or ANTHROPIC_API_KEY) as an environment variable and restart the server.");
       }
       if (findBot(room, team, role)) return socket.emit("error_msg", `${team.toUpperCase()} already has an AI ${role}.`);
       if (role === "spymaster") {
